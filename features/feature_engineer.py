@@ -39,10 +39,36 @@ class FeatureEngineer:
 
     def _fractional_differentiation(self, series: pd.Series, d: float, threshold: float = 1e-4) -> pd.Series:
         """
-        Applies fractional differentiation to preserve memory while achieving stationarity.
-        Implementation logic omitted for brevity (requires binomial coefficient expanding window).
+        Applies fractional differentiation. Calculates binomial coefficients (weights)
+        and applies them to the time series to achieve stationarity while preserving memory.
         """
-        raise NotImplementedError("Fractional differencing mathematical logic to be implemented here.")
+        # 1. Compute weights based on fraction d
+        weights = [1.0]
+        k = 1
+        while True:
+            weight = -weights[-1] * (d - k + 1) / k
+            if abs(weight) < threshold:
+                break
+            weights.append(weight)
+            k += 1
+
+        weights = np.array(weights[::-1]) # Reverse to align with chronological order
+        window_size = len(weights)
+
+        # 2. Apply weights via rolling dot product
+        frac_diff = pd.Series(index=series.index, dtype=np.float64)
+
+        # Optimization: Use numpy stride tricks or rolling apply for speed
+        # For a clean implementation, we use a loop over valid indices
+        prices = series.values
+
+        for i in range(window_size, len(prices)):
+            window_data = prices[i - window_size : i]
+            frac_diff.iloc[i] = np.dot(weights, window_data)
+
+        # Add to feature columns list (assuming this is called within a pipeline loop)
+        col_name = f"frac_diff_{str(d).replace('.', '_')}"
+        return frac_diff
 
     def process_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """
