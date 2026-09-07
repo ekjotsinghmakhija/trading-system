@@ -7,6 +7,7 @@ gymnasium>=0.29.1
 numpy>=1.24.0
 pandas>=2.0.0
 scipy>=1.10.1
+kiteconnect
 
 # Telemetry
 tensorboard>=2.14.0
