@@ -2,7 +2,11 @@ import os
 import time
 import pandas as pd
 from datetime import datetime, timedelta
+from dotenv import load_dotenv
 from kiteconnect import KiteConnect
+
+# Load environment variables from .env file
+load_dotenv()
 
 
 class ZerodhaDataFetcher:
@@ -31,7 +35,7 @@ class ZerodhaDataFetcher:
             self.kite.set_access_token(access_token)
             print("Authentication complete. Token saved locally.")
 
-    def get_current_nifty_future_token(() -> int:
+    def get_current_nifty_future_token(self) -> int:
         """Fetches current month Nifty Future instrument token from active NFO list."""
         instruments = pd.DataFrame(self.kite.instruments("NFO"))
         nifty_futs = instruments[(instruments["name"] == "NIFTY") & (instruments["segment"] == "NFO-FUT")]
@@ -82,9 +86,11 @@ class ZerodhaDataFetcher:
 
 
 if __name__ == "__main__":
-    # Credentials setup
-    API_KEY = os.getenv("ZERODHA_API_KEY", "your_api_key_here")
-    API_SECRET = os.getenv("ZERODHA_API_SECRET", "your_api_secret_here")
+    API_KEY = os.getenv("ZERODHA_API_KEY")
+    API_SECRET = os.getenv("ZERODHA_API_SECRET")
+
+    if not API_KEY or not API_SECRET:
+        raise ValueError("Missing ZERODHA_API_KEY or ZERODHA_API_SECRET in environment variables or .env file.")
 
     fetcher = ZerodhaDataFetcher(api_key=API_KEY, api_secret=API_SECRET)
     fetcher.authenticate()
