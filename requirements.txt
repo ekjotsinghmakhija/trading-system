@@ -9,6 +9,9 @@ pandas>=2.0.0
 scipy>=1.10.1
 kiteconnect
 
+# API
+python-dotenv
+
 # Telemetry
 tensorboard>=2.14.0
 
