@@ -1,17 +1,19 @@
 import numpy as np
 import pandas as pd
-from typing import List, Dict, Optional
+from typing import List
+
 
 class FeatureEngineer:
     """
     Zero-lookahead feature extraction pipeline.
-    Transforms raw OHLCV data into stationary state vectors.
+    Transforms raw OHLCV data into stationary state vectors while retaining execution data.
     """
 
-    def __init__(self, return_horizons: List[int] = [1, 5, 15, 60], vol_window: int = 20, zscore_window: int = 200):
+    def __init__(self, return_horizons: List[int] = [1, 5, 15, 60], vol_window: int = 20, zscore_window: int = 200, frac_d: float = 0.4):
         self.return_horizons = return_horizons
         self.vol_window = vol_window
         self.zscore_window = zscore_window
+        self.frac_d = frac_d
         self.feature_columns: List[str] = []
 
     def _calculate_log_returns(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -37,54 +39,53 @@ class FeatureEngineer:
         self.feature_columns.append("volume_zscore")
         return df
 
-    def _fractional_differentiation(self, series: pd.Series, d: float, threshold: float = 1e-4) -> pd.Series:
-        """
-        Applies fractional differentiation. Calculates binomial coefficients (weights)
-        and applies them to the time series to achieve stationarity while preserving memory.
-        """
-        # 1. Compute weights based on fraction d
+    def _calculate_frac_diff(self, df: pd.DataFrame, threshold: float = 1e-4) -> pd.DataFrame:
+        """Applies vectorized fractional differentiation on Close prices to preserve memory."""
         weights = [1.0]
         k = 1
         while True:
-            weight = -weights[-1] * (d - k + 1) / k
-            if abs(weight) < threshold:
+            w_k = -weights[-1] / k * (self.frac_d - k + 1)
+            if abs(w_k) < threshold:
                 break
-            weights.append(weight)
+            weights.append(w_k)
             k += 1
 
-        weights = np.array(weights[::-1]) # Reverse to align with chronological order
-        window_size = len(weights)
+        weights = np.array(weights[::-1])
+        res = np.convolve(df["close"].values, weights, mode="valid")
 
-        # 2. Apply weights via rolling dot product
-        frac_diff = pd.Series(index=series.index, dtype=np.float64)
+        # Pad initial steps with NaN to match series index alignment safely
+        pad_size = len(df["close"]) - len(res)
+        frac_diff_series = np.pad(res, (pad_size, 0), mode='constant', constant_values=np.nan)
 
-        # Optimization: Use numpy stride tricks or rolling apply for speed
-        # For a clean implementation, we use a loop over valid indices
-        prices = series.values
-
-        for i in range(window_size, len(prices)):
-            window_data = prices[i - window_size : i]
-            frac_diff.iloc[i] = np.dot(weights, window_data)
-
-        # Add to feature columns list (assuming this is called within a pipeline loop)
-        col_name = f"frac_diff_{str(d).replace('.', '_')}"
-        return frac_diff
+        col_name = f"frac_diff_{str(self.frac_d).replace('.', '_')}"
+        df[col_name] = frac_diff_series
+        self.feature_columns.append(col_name)
+        return df
 
     def process_data(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Main pipeline execution. Enforces strict ffill for missing data to prevent lookahead.
-        """
+        """Main pipeline execution."""
         df = df.copy()
 
-        # 1. Strict anti-lookahead forward fill for gaps
+        # 1. Forward-fill gaps to eliminate lookahead bias
         df.ffill(inplace=True)
 
-        # 2. Compute features
+        # 2. Compute stationary state features
         df = self._calculate_log_returns(df)
         df = self._calculate_parkinson_volatility(df)
         df = self._calculate_volume_zscore(df)
+        df = self._calculate_frac_diff(df)
 
-        # 3. Drop NaNs created by rolling windows (removes early rows, zero lookahead impact)
+        # 3. Drop early rows containing NaNs from rolling/convolution operations
         df.dropna(subset=self.feature_columns, inplace=True)
+        df.reset_index(drop=True, inplace=True)
 
-        return df[self.feature_columns]
+        # Return full dataset retaining execution columns (timestamp, close) alongside feature columns
+        return df
+
+
+if __name__ == "__main__":
+    raw_df = pd.read_csv("data/raw/market_data.csv")
+    fe = FeatureEngineer()
+    featured_df = fe.process_data(raw_df)
+    featured_df.to_csv("data/processed/featured_market_data.csv", index=False)
+    print("Feature processing complete. Output shape:", featured_df.shape)
