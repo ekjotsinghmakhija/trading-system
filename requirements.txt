@@ -3,17 +3,26 @@ torch>=2.0.0
 stable-baselines3>=2.2.1
 gymnasium>=0.29.1
 
-# Data Processing & Math
+# Data Processing & Storage Engine
 numpy>=1.24.0
 pandas>=2.0.0
+polars>=1.0.0
+duckdb>=1.0.0
 scipy>=1.10.1
+pyarrow>=14.0.0
+
+# Feature Engineering & Statistical Analysis
+scikit-learn>=1.3.0
+statsmodels>=0.14.0
+
+# API & Broker Integration
 kiteconnect
 
-# API
+# Environment & Configuration
 python-dotenv
 
-# Telemetry
+# Telemetry & Experiment Tracking
 tensorboard>=2.14.0
 
-# (Optional) Hyperparameter Optimization for later
+# (Optional) Hyperparameter Optimization
 optuna>=3.4.0
