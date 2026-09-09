@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import gymnasium as gym
 from gymnasium import spaces
-from typing import Tuple, Dict, Any
+from typing import Optional, Dict, Tuple, Any, List
 
 class StrictFrictionEnv(gym.Env):
     """

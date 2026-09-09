@@ -23,7 +23,12 @@ def make_env(data_path: str):
         aligned_data = raw_df.loc[features_df.index].reset_index(drop=True)
         features_df = features_df.reset_index(drop=True)
 
-        env = StrictFrictionEnv(data=aligned_data, features=features_df)
+        # Drop non-numeric metadata columns from observation space
+        numeric_features = features_df.select_dtypes(include=['float32', 'float64', 'int32', 'int64', 'number'])
+        if 'timestamp' in numeric_features.columns:
+            numeric_features = numeric_features.drop(columns=['timestamp'])
+            
+        env = StrictFrictionEnv(data=aligned_data, features=numeric_features)
         return Monitor(env)
     return _init
 
@@ -35,7 +40,7 @@ def train():
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     # 1. Instantiate Vectorized & Normalized Environment
-    train_env_fn = make_env("data/processed/train_data.csv")
+    train_env_fn = make_env("data/processed/train_1min.csv")
     env = DummyVecEnv([train_env_fn])
 
     # Normalize features and rewards (Critical for policy stability in RL)
