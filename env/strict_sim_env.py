@@ -2,42 +2,44 @@ import numpy as np
 import pandas as pd
 import gymnasium as gym
 from gymnasium import spaces
-from typing import Optional, Dict, Tuple, Any, List
+from typing import Optional, Dict, Tuple, Any, Union
 
-class StrictFrictionEnv(gym.Env):
+
+class AdvancedFrictionEnv(gym.Env):
     """
-    Custom Gym Environment for algorithmic trading with +10% friction strictness
-    and drawdown-penalized reward mechanics.
+    Advanced Trading Environment featuring continuous position allocation [-1, 1],
+    holding duration penalties, dynamic volatility slippage, and drawdown limits.
     """
-    metadata = {'render_modes': ['human', 'system']}
+    metadata = {'render_modes': ['human']}
 
-    def __init__(self, data: pd.DataFrame, features: pd.DataFrame, initial_balance: float = 50000.0):
-        super(StrictFrictionEnv, self).__init__()
+    def __init__(self, data: Union[pd.DataFrame, pd.Series], features: pd.DataFrame, initial_balance: float = 50000.0):
+        super(AdvancedFrictionEnv, self).__init__()
 
-        # Ensure data alignment
-        assert len(data) == len(features), "Raw data and features must align perfectly."
+        # Defensive type checks
+        if isinstance(data, (list, np.ndarray)):
+            self.data = pd.DataFrame(data, columns=['close']).reset_index(drop=True)
+        elif isinstance(data, pd.Series):
+            self.data = data.to_frame(name='close').reset_index(drop=True)
+        else:
+            self.data = data.reset_index(drop=True)
 
-        self.data = data.reset_index(drop=True)
-        self.features = features.reset_index(drop=True).values
+        self.feature_colnames = list(features.columns)
+        self.parkinson_idx = self.feature_colnames.index("parkinson_vol") if "parkinson_vol" in self.feature_colnames else None
+
+        self.features = features.reset_index(drop=True).values.astype(np.float32)
         self.initial_balance = initial_balance
         self.max_steps = len(self.data) - 1
 
-        # Action Space: 0 (Short), 1 (Flat), 2 (Long)
-        self.action_space = spaces.Discrete(3)
+        # Continuous action space: target leverage from -1.0 (100% Short) to +1.0 (100% Long)
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
 
-        # Observation Space: N-dimensional feature vector
-        self.obs_shape = self.features.shape[1]
+        # Observation space includes features plus current position leverage
+        self.obs_shape = self.features.shape[1] + 1
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(self.obs_shape,), dtype=np.float32
         )
 
-        # Friction Constants (Indian Markets + 10%)
-        # Brokerage + STT + GST + SEBI approximated as percentage of notional
-        self.base_txn_cost_pct = 0.0003  # ~3 bps average per leg
-        self.strictness_multiplier = 1.10
-        self.sim_txn_cost_pct = self.base_txn_cost_pct * self.strictness_multiplier
-
-        self.reset()
+        self.sim_txn_cost_pct = 0.0003 * 1.10  # Base cost + 10% safety buffer
 
     def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None) -> Tuple[np.ndarray, Dict]:
         super().reset(seed=seed)
@@ -46,77 +48,62 @@ class StrictFrictionEnv(gym.Env):
         self.balance = self.initial_balance
         self.peak_balance = self.initial_balance
         self.current_drawdown = 0.0
+        self.current_position = 0.0
 
-        self.current_position = 0 # -1, 0, 1
+        return self._get_observation(), {}
 
-        return self.features[self.current_step], {}
+    def _get_observation(self) -> np.ndarray:
+        feat_obs = self.features[self.current_step]
+        return np.append(feat_obs, self.current_position).astype(np.float32)
 
-    def _calculate_slippage(self, volatility: float) -> float:
-        """Dynamic slippage scaled by current volatility and strictness multiplier."""
-        base_slippage_pct = 0.0001 # 1 bps minimum
-        vol_adjusted_slippage = base_slippage_pct + (volatility * 0.05)
-        return vol_adjusted_slippage * self.strictness_multiplier
+    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
+        target_position = float(np.clip(action[0], -1.0, 1.0))
 
-    def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
-        # Map action [0, 1, 2] to position [-1, 0, 1]
-        target_position = action - 1
+        current_price = float(self.data.iloc[self.current_step]['close'])
+        next_price = float(self.data.iloc[self.current_step + 1]['close'])
 
-        # 1. Fetch current step data
-        current_price = self.data.iloc[self.current_step]['close']
-        next_price = self.data.iloc[self.current_step + 1]['close']
-        volatility = self.features[self.current_step][self.features.columns.get_loc("parkinson_vol")] # Assuming mapped
+        position_change = abs(target_position - self.current_position)
 
-        # 2. Execution logic & Friction
-        transaction_cost = 0.0
-        slippage_cost = 0.0
+        if self.parkinson_idx is not None:
+            volatility = float(self.features[self.current_step][self.parkinson_idx])
+        else:
+            volatility = 0.001
 
-        if target_position != self.current_position:
-            # We are transacting
-            transaction_cost = self.sim_txn_cost_pct
-            slippage_cost = self._calculate_slippage(volatility)
-            self.current_position = target_position
+        slippage = (0.0001 + (volatility * 0.05)) * 1.10
+        friction_cost = position_change * (self.sim_txn_cost_pct + slippage)
 
-        # 3. Calculate Market Return (t to t+1)
         market_return = (next_price - current_price) / current_price
+        gross_return = self.current_position * market_return
+        net_step_return = gross_return - friction_cost
 
-        # 4. Calculate Portfolio Step Return (Zero Leverage)
-        step_return = (self.current_position * market_return) - transaction_cost - slippage_cost
+        self.current_position = target_position
+        self.balance *= (1.0 + net_step_return)
 
-        # Update Balance
-        self.balance *= (1 + step_return)
-
-        # 5. Drawdown Tracking
         if self.balance > self.peak_balance:
             self.peak_balance = self.balance
 
         self.current_drawdown = (self.peak_balance - self.balance) / self.peak_balance
 
-        # 6. Drawdown-Penalized Reward Function
-        # Base reward is the step PnL percentage
-        reward = step_return
+        # Reward formulation
+        reward = net_step_return * 100.0
+        if self.current_drawdown > 0.20:
+            reward -= (self.current_drawdown - 0.20) * 50.0
 
-        # Continuous quadratic penalty for being in drawdown
-        lambda_penalty = 2.0
-        reward -= lambda_penalty * (self.current_drawdown ** 2)
-
-        # 7. Terminal Conditions
         terminated = False
         truncated = False
 
-        # Hard Stop: > 25% Drawdown
-        if self.current_drawdown > 0.25:
-            reward -= 10.0 # Massive terminal penalty (beta)
+        if self.current_drawdown >= 0.30:
+            reward -= 50.0
             terminated = True
 
         self.current_step += 1
         if self.current_step >= self.max_steps:
             truncated = True
 
-        next_obs = self.features[self.current_step]
         info = {
             "balance": self.balance,
             "drawdown": self.current_drawdown,
             "position": self.current_position
         }
 
-        return next_obs, reward, terminated, truncated, info
+        return self._get_observation(), reward, terminated, truncated, info

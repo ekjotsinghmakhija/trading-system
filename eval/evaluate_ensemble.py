@@ -3,21 +3,20 @@ import numpy as np
 import pandas as pd
 from typing import Dict, Any, Tuple
 
-from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
-
 from env.strict_sim_env import AdvancedFrictionEnv
 from features.feature_engineer import FeatureEngineer
+from eval.ensemble_agent import EnsembleAgent
 
 
-class CPCVEvaluator:
-    """
-    Evaluator for out-of-sample combinatorial cross-validation (CPCV) blocks using RecurrentPPO.
-    """
-    def __init__(self, model_path: str, vec_norm_path: str = None, initial_balance: float = 50000.0):
-        self.model_path = model_path
-        self.vec_norm_path = vec_norm_path
+class EnsembleEvaluator:
+    def __init__(self, leaderboard_csv: str = "models/checkpoints/leaderboard.csv", top_k: int = 5, initial_balance: float = 50000.0):
         self.initial_balance = initial_balance
+        self.ensemble = EnsembleAgent(leaderboard_csv=leaderboard_csv, top_k=top_k)
+
+        # Load vector normalization stats from the top checkpoint
+        df_leader = pd.read_csv(leaderboard_csv)
+        self.vec_norm_path = df_leader.iloc[0]['vec_norm']
 
     def _prepare_env(self, raw_df: pd.DataFrame) -> Tuple[Any, pd.DataFrame]:
         fe = FeatureEngineer()
@@ -52,9 +51,8 @@ class CPCVEvaluator:
 
         return env, processed_df
 
-    def evaluate_block(self, raw_df: pd.DataFrame) -> Dict[str, Any]:
-        env, processed_df = self._prepare_env(raw_df)
-        model = RecurrentPPO.load(self.model_path, env=env)
+    def evaluate(self, test_df: pd.DataFrame) -> Dict[str, Any]:
+        env, processed_df = self._prepare_env(test_df)
 
         obs = env.reset()
         done = False
@@ -63,16 +61,15 @@ class CPCVEvaluator:
         positions = []
         drawdowns = []
 
-        # RecurrentPPO requires zero-initialized LSTM states for deterministic evaluation
-        lstm_states = None
+        num_models = len(self.ensemble.models)
+        lstm_states = [None] * num_models
         episode_starts = np.ones((1,), dtype=bool)
 
         while not done:
-            action, lstm_states = model.predict(
+            action, lstm_states = self.ensemble.predict_ensemble_action(
                 obs,
-                state=lstm_states,
-                episode_start=episode_starts,
-                deterministic=True
+                lstm_states_list=lstm_states,
+                episode_starts=episode_starts
             )
             obs, rewards, dones, infos = env.step(action)
 
@@ -105,9 +102,9 @@ class CPCVEvaluator:
         }
 
 
-def print_evaluation_report(results: Dict[str, Any]):
+def print_ensemble_report(results: Dict[str, Any]):
     print("\n" + "=" * 50)
-    print("      OUT-OF-SAMPLE EVALUATION REPORT           ")
+    print("      ENSEMBLE OUT-OF-SAMPLE EVALUATION REPORT   ")
     print("=" * 50)
     print(f" Initial Balance        : ${results['initial_balance']:,.2f}")
     print(f" Final Balance          : ${results['final_balance']:,.2f}")

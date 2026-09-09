@@ -1,16 +1,16 @@
-.venv/
+# Python Cache & Virtual Environments
 .env
-access_token.txt
-
-# Python Cache & Environments
 __pycache__/
 *.py[cod]
 *$py.class
 venv/
 .venv/
 
-# Datasets & Models
+# Datasets & Checkpoints
 data/raw/*
 data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
 models/checkpoints/*
 tensorboard_logs/
+*.log
