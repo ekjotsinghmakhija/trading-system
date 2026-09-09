@@ -2,108 +2,173 @@ import numpy as np
 import pandas as pd
 import gymnasium as gym
 from gymnasium import spaces
-from typing import Optional, Dict, Tuple, Any, Union
 
-
-class AdvancedFrictionEnv(gym.Env):
+class StrictOptionSimEnv(gym.Env):
     """
-    Advanced Trading Environment featuring continuous position allocation [-1, 1],
-    holding duration penalties, dynamic volatility slippage, and drawdown limits.
+    Gymnasium environment for Indian Index Options intraday trading.
+    - Observation Space: (60, num_features) normalized sequence matrix
+    - Action Space: Continuous scalar in [-1.0, +1.0]
+        * action >  0.25: Go Long Call (Bullish)
+        * action < -0.25: Go Long Put (Bearish)
+        * -0.25 <= action <= 0.25: Flat / Close Position
+    - Enforces max holding time of 60 minutes, STT/brokerage friction, and intraday square-off.
     """
-    metadata = {'render_modes': ['human']}
+    metadata = {"render_modes": ["human"]}
 
-    def __init__(self, data: Union[pd.DataFrame, pd.Series], features: pd.DataFrame, initial_balance: float = 50000.0):
-        super(AdvancedFrictionEnv, self).__init__()
+    def __init__(self, df: pd.DataFrame, feature_cols: list, initial_capital: float = 100000.0, sequence_length: int = 60):
+        super().__init__()
+        self.df = df.reset_index(drop=True)
+        self.feature_cols = feature_cols
+        self.initial_capital = initial_capital
+        self.sequence_length = sequence_length
+        self.num_features = len(feature_cols)
 
-        # Defensive type checks
-        if isinstance(data, (list, np.ndarray)):
-            self.data = pd.DataFrame(data, columns=['close']).reset_index(drop=True)
-        elif isinstance(data, pd.Series):
-            self.data = data.to_frame(name='close').reset_index(drop=True)
-        else:
-            self.data = data.reset_index(drop=True)
-
-        self.feature_colnames = list(features.columns)
-        self.parkinson_idx = self.feature_colnames.index("parkinson_vol") if "parkinson_vol" in self.feature_colnames else None
-
-        self.features = features.reset_index(drop=True).values.astype(np.float32)
-        self.initial_balance = initial_balance
-        self.max_steps = len(self.data) - 1
-
-        # Continuous action space: target leverage from -1.0 (100% Short) to +1.0 (100% Long)
+        # Environment Spaces
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=(self.sequence_length, self.num_features), dtype=np.float32
+        )
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
 
-        # Observation space includes features plus current position leverage
-        self.obs_shape = self.features.shape[1] + 1
-        self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(self.obs_shape,), dtype=np.float32
-        )
+        # Internal Execution Constants
+        self.LOT_SIZE = 25  # Nifty option lot size
+        self.STT_PREMIUM_RATE = 0.000625  # STT 0.0625% on sell side premium
+        self.BROKERAGE_PER_ORDER = 20.0  # ₹20 flat per order
+        self.MAX_HOLDING_MINUTES = 60
 
-        self.sim_txn_cost_pct = 0.0003 * 1.10  # Base cost + 10% safety buffer
-
-    def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None) -> Tuple[np.ndarray, Dict]:
-        super().reset(seed=seed)
-
+        # State Variables
         self.current_step = 0
-        self.balance = self.initial_balance
-        self.peak_balance = self.initial_balance
-        self.current_drawdown = 0.0
-        self.current_position = 0.0
-
-        return self._get_observation(), {}
+        self.capital = initial_capital
+        self.position = 0  # 0: Flat, +1: Long Call, -1: Long Put
+        self.entry_price = 0.0
+        self.entry_step = 0
+        self.returns_history = []
 
     def _get_observation(self) -> np.ndarray:
-        feat_obs = self.features[self.current_step]
-        return np.append(feat_obs, self.current_position).astype(np.float32)
+        start_idx = self.current_step - self.sequence_length + 1
+        end_idx = self.current_step + 1
+        obs = self.df.iloc[start_idx:end_idx][self.feature_cols].values
+        return obs.astype(np.float32)
 
-    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
-        target_position = float(np.clip(action[0], -1.0, 1.0))
+    def reset(self, seed: int = None, options: dict = None) -> tuple[np.ndarray, dict]:
+        super().reset(seed=seed)
+        self.current_step = self.sequence_length - 1
+        self.capital = self.initial_capital
+        self.position = 0
+        self.entry_price = 0.0
+        self.entry_step = 0
+        self.returns_history = []
 
-        current_price = float(self.data.iloc[self.current_step]['close'])
-        next_price = float(self.data.iloc[self.current_step + 1]['close'])
+        obs = self._get_observation()
+        info = {"capital": self.capital, "position": self.position}
+        return obs, info
 
-        position_change = abs(target_position - self.current_position)
+    def _calculate_frictions(self, premium: float, is_exit: bool = False) -> float:
+        """Calculates total transaction friction including turnover fees and STT."""
+        turnover = premium * self.LOT_SIZE
+        stt = turnover * self.STT_PREMIUM_RATE if is_exit else 0.0
+        exchange_charges = turnover * 0.0005  # Exchange transaction fee
+        return self.BROKERAGE_PER_ORDER + stt + exchange_charges
 
-        if self.parkinson_idx is not None:
-            volatility = float(self.features[self.current_step][self.parkinson_idx])
-        else:
-            volatility = 0.001
+    def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict]:
+        act_val = float(action[0])
+        current_price = float(self.df.iloc[self.current_step]["close"])
 
-        slippage = (0.0001 + (volatility * 0.05)) * 1.10
-        friction_cost = position_change * (self.sim_txn_cost_pct + slippage)
+        # Determine intended target direction
+        target_pos = 0
+        if act_val > 0.25:
+            target_pos = 1
+        elif act_val < -0.25:
+            target_pos = -1
 
-        market_return = (next_price - current_price) / current_price
-        gross_return = self.current_position * market_return
-        net_step_return = gross_return - friction_cost
+        step_pnl = 0.0
+        forced_exit = False
 
-        self.current_position = target_position
-        self.balance *= (1.0 + net_step_return)
+        # Holding Cap Enforcer (60 Minutes Limit)
+        if self.position != 0 and (self.current_step - self.entry_step) >= self.MAX_HOLDING_MINUTES:
+            target_pos = 0
+            forced_exit = True
 
-        if self.balance > self.peak_balance:
-            self.peak_balance = self.balance
+        # End-of-Day Enforcer (Square off at 15:15 IST / step near end)
+        if self.current_step >= len(self.df) - 2:
+            target_pos = 0
 
-        self.current_drawdown = (self.peak_balance - self.balance) / self.peak_balance
+        # Execute Order & Position Updates
+        if target_pos != self.position:
+            # 1. Close Existing Position
+            if self.position != 0:
+                raw_return = (current_price - self.entry_price) if self.position == 1 else (self.entry_price - current_price)
+                raw_pnl = raw_return * self.LOT_SIZE
+                friction = self._calculate_frictions(current_price, is_exit=True)
+                step_pnl += (raw_pnl - friction)
+                self.position = 0
 
-        # Reward formulation
-        reward = net_step_return * 100.0
-        if self.current_drawdown > 0.20:
-            reward -= (self.current_drawdown - 0.20) * 50.0
+            # 2. Open New Position
+            if target_pos != 0:
+                friction = self._calculate_frictions(current_price, is_exit=False)
+                step_pnl -= friction
+                self.position = target_pos
+                self.entry_price = current_price
+                self.entry_step = self.current_step
 
-        terminated = False
-        truncated = False
+        elif self.position != 0:
+            # Mark-to-market step return calculation
+            prev_price = float(self.df.iloc[self.current_step - 1]["close"])
+            price_diff = current_price - prev_price
+            step_pnl += (price_diff * self.LOT_SIZE) if self.position == 1 else (-price_diff * self.LOT_SIZE)
 
-        if self.current_drawdown >= 0.30:
-            reward -= 50.0
-            terminated = True
+        # Update Portfolio Capital
+        self.capital += step_pnl
+        step_return = step_pnl / self.capital
+        self.returns_history.append(step_return)
 
+        # Reward Calculation: Differential Sharpe Ratio Proxy
+        ret_mean = np.mean(self.returns_history[-20:]) if len(self.returns_history) >= 20 else 0.0
+        ret_std = np.std(self.returns_history[-20:]) + 1e-6
+        reward = float(step_return / ret_std)
+
+        # Apply Forced Exit Penalty
+        if forced_exit:
+            reward -= 0.05
+
+        # Progress Time Index
         self.current_step += 1
-        if self.current_step >= self.max_steps:
-            truncated = True
+        terminated = self.current_step >= len(self.df) - 1
+        truncated = self.capital <= (self.initial_capital * 0.70)  # Stop trading if 30% drawdown reached
 
+        obs = self._get_observation() if not terminated else np.zeros(self.observation_space.shape, dtype=np.float32)
         info = {
-            "balance": self.balance,
-            "drawdown": self.current_drawdown,
-            "position": self.current_position
+            "capital": self.capital,
+            "position": self.position,
+            "step_pnl": step_pnl,
+            "forced_exit": forced_exit
         }
 
-        return self._get_observation(), reward, terminated, truncated, info
+        return obs, reward, terminated, truncated, info
+
+
+if __name__ == "__main__":
+    # Test Environment Integration
+    from features.feature_engineer import FeatureEngine
+
+    dates = pd.date_range("2026-09-01 09:15:00", periods=200, freq="1min", tz="UTC")
+    dummy_df = pd.DataFrame({
+        "timestamp": dates,
+        "open": np.random.randn(200).cumsum() + 25000,
+        "high": np.random.randn(200).cumsum() + 25020,
+        "low": np.random.randn(200).cumsum() + 24980,
+        "close": np.random.randn(200).cumsum() + 25000,
+        "volume": np.random.randint(100, 5000, size=200)
+    })
+
+    engine = FeatureEngine(dummy_df)
+    matrix = engine.build_feature_matrix()
+    feature_cols = [c for c in matrix.columns if c.startswith("feat_")]
+
+    env = StrictOptionSimEnv(matrix, feature_cols)
+    obs, info = env.reset()
+    print(f"[✓] Environment initialized successfully.")
+    print(f"    Observation Shape: {obs.shape}")
+
+    # Run a test step with positive long signal action
+    next_obs, reward, term, trunc, info = env.step(np.array([0.8]))
+    print(f"    Step Test Output -> Reward: {reward:.4f}, Capital: {info['capital']:.2f}, Position: {info['position']}")
