@@ -1,136 +1,111 @@
 import os
-import logging
+import sys
+from pathlib import Path
+
+# Add project root to sys.path
+PROJECT_ROOT = Path(__file__).resolve().parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import duckdb
 import torch
 import numpy as np
-from torch.distributions import Categorical
-from models.architecture import ActorCriticTCNGRU
-from models.train_engine import HighThroughputPPOTrainer
-from features.feature_engineer import FeatureEngineer
+import polars as pl
 
-logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)s] [%(name)s] - %(message)s")
-logger = logging.getLogger("quantum_engine")
+from features.factor_ledger import FactorLedger
+from models.architecture import DualAlphaTCN
+from execution.risk_manager import RiskManager
+from env.strict_sim_env import StrictSimEnv
 
+DB_PATH = "data/duckdb/market_data.duckdb"
 
-def compute_gae(rewards, values, next_value, gamma=0.99, gae_lambda=0.95):
-    """Computes Generalized Advantage Estimation (GAE) and Returns-to-Go."""
-    advantages = torch.zeros_like(rewards)
-    last_gae = 0.0
-    for t in reversed(range(len(rewards))):
-        v_next = next_value if t == len(rewards) - 1 else values[t + 1]
-        delta = rewards[t] + gamma * v_next - values[t]
-        last_gae = delta + gamma * gae_lambda * last_gae
-        advantages[t] = last_gae
-    return advantages, advantages + values
+def run_end_to_end_system():
+    print("[1/5] Connecting to DuckDB & Loading Feature Space...")
+    con = duckdb.connect(DB_PATH)
+    nifty_df = con.execute("SELECT * FROM nifty_features_1m ORDER BY timestamp").pl().drop_nulls()
+    banknifty_df = con.execute("SELECT * FROM banknifty_features_1m ORDER BY timestamp").pl().drop_nulls()
+    con.close()
 
+    common_ts = nifty_df.select("timestamp").intersect(banknifty_df.select("timestamp"))
+    nifty_df = nifty_df.join(common_ts, on="timestamp").sort("timestamp")
+    banknifty_df = banknifty_df.join(common_ts, on="timestamp").sort("timestamp")
 
-def run_production_pipeline():
-    logger.info("Initializing Quantum Engine Institutional Alpha Pipeline...")
-    os.makedirs("checkpoints", exist_ok=True)
+    feature_cols = [c for c in nifty_df.columns if c not in ["timestamp", "trading_date", "target_5m_return"]]
 
-    db_path = "data/duckdb/market_data.duckdb"
-    if not os.path.exists(db_path):
-        raise FileNotFoundError(f"Database file not found at {db_path}.")
+    print("[2/5] Initializing Factor Ledger & Hazard Memory...")
+    ledger = FactorLedger(hazard_threshold=-0.0015, target_threshold=0.0020, k_neighbors=25)
+    ledger_stats = ledger.build_ledger(nifty_df, feature_cols)
+    print(f"      └─ Ledger Ready: {ledger_stats['total_states']} historical states logged.")
 
-    conn = duckdb.connect(db_path)
-    df_raw = conn.execute("SELECT * FROM ohlcv_bars ORDER BY timestamp ASC").df()
-    conn.close()
+    print("[3/5] Loading DualAlphaTCN Model Weights...")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = DualAlphaTCN(in_channels=len(feature_cols)).to(device)
+    model.eval()
 
-    logger.info("Computing microstructural alpha feature matrix...")
-    engineer = FeatureEngineer()
-    df_features = engineer.compute_18_alpha_matrix(df_raw).dropna().reset_index(drop=True)
+    print("[4/5] Initializing Risk Manager & Strict Simulator...")
+    risk_mgr = RiskManager(max_drawdown_limit=0.30, kelly_fraction=0.5)
+    sim = StrictSimEnv(initial_capital=1000000.0, slippage_ticks=0.5)
 
-    exclude_cols = {'timestamp', 'date', 'symbol', 'open', 'high', 'low', 'close', 'volume', 'oi'}
-    feature_cols = [c for c in df_features.columns if c.lower() not in exclude_cols]
-    log_returns = df_features['log_return'].values
+    print("[5/5] Running High-Fidelity Historical Replay...")
+    timestamps = nifty_df.select("timestamp").to_series().to_list()
+    nifty_prices = nifty_df.select("close").to_series().to_numpy()
+    banknifty_prices = banknifty_df.select("close").to_series().to_numpy()
 
-    # Robust Feature Scaling (Median Absolute Deviation / Quantile Standardization)
-    raw_obs = torch.tensor(df_features[feature_cols].values, dtype=torch.float32)
-    obs_clean = torch.nan_to_num(raw_obs, nan=0.0, posinf=0.0, neginf=0.0)
+    seq_len = 15
+    nifty_feats = nifty_df.select(feature_cols).to_numpy()
+    banknifty_feats = banknifty_df.select(feature_cols).to_numpy()
 
-    mean = obs_clean.mean(dim=0, keepdim=True)
-    std = obs_clean.std(dim=0, keepdim=True) + 1e-8
-    obs_data = torch.clamp((obs_clean - mean) / std, -5.0, 5.0)
+    daily_logs = []
 
-    # Action Mapping: Index 0 -> Short (-1), Index 1 -> Flat (0), Index 2 -> Long (+1)
-    action_map = torch.tensor([-1.0, 0.0, 1.0])
-    model = ActorCriticTCNGRU(input_dim=len(feature_cols), action_dim=3)
-    trainer = HighThroughputPPOTrainer(model=model, lr=3e-5)
-    device = trainer.device
-    action_map = action_map.to(device)
+    for idx in range(seq_len, len(timestamps)):
+        current_ts = str(timestamps[idx])
 
-    rollout_horizon = 4096
-    num_epochs = 10
-    total_steps = len(obs_data) - 1
-    cost_bps = 0.0001  # 1 bp transaction friction
-    best_sharpe = -float("inf")
+        prices = {
+            "NIFTY": float(nifty_prices[idx]),
+            "BANKNIFTY": float(banknifty_prices[idx])
+        }
 
-    logger.info("Starting Institutional Alpha RL Optimization Loop...")
+        current_state = nifty_feats[idx]
+        hazard_prob, is_suppressed = ledger.evaluate_hazard_probability(current_state)
 
-    for epoch in range(1, num_epochs + 1):
-        epoch_loss, batch_count = 0.0, 0
-        all_step_rewards = []
+        if is_suppressed[0]:
+            target_weights = {"NIFTY": 0.0, "BANKNIFTY": 0.0}
+        else:
+            x_nifty = torch.tensor(nifty_feats[idx-seq_len:idx].T, dtype=torch.float32).unsqueeze(0).to(device)
+            x_banknifty = torch.tensor(banknifty_feats[idx-seq_len:idx].T, dtype=torch.float32).unsqueeze(0).to(device)
 
-        for start_idx in range(0, total_steps - rollout_horizon, rollout_horizon):
-            end_idx = start_idx + rollout_horizon
-            obs_batch = obs_data[start_idx:end_idx].to(device)
-            future_returns = torch.tensor(log_returns[start_idx+1:end_idx+1], dtype=torch.float32, device=device)
-
-            model.eval()
             with torch.no_grad():
-                features = model(obs_batch)
-                logits = model.actor(features)
-                values = model.critic(features).squeeze(-1)
-                next_val = model.critic(model(obs_data[end_idx:end_idx+1].to(device))).squeeze(-1)
+                z_nifty, z_banknifty = model(x_nifty, x_banknifty)
+                exp_returns = np.array([z_nifty.item(), z_banknifty.item()])
 
-                dist = Categorical(logits=logits)
-                actions = dist.sample()
-                log_probs = dist.log_prob(actions)
+            hist_nifty_rets = np.diff(nifty_prices[max(0, idx-60):idx+1]) / nifty_prices[max(0, idx-60):idx]
+            hist_bn_rets = np.diff(banknifty_prices[max(0, idx-60):idx+1]) / banknifty_prices[max(0, idx-60):idx]
+            hist_matrix = np.column_stack([hist_nifty_rets, hist_bn_rets])
 
-            # Map Discrete Actions -> Net Positions
-            positions = action_map[actions]
+            if len(hist_matrix) > 5:
+                allocations = risk_mgr.calculate_allocations(
+                    expected_returns=exp_returns,
+                    historical_returns=hist_matrix,
+                    current_portfolio_value=sim.capital,
+                    timestamp_str=current_ts
+                )
+                target_weights = {"NIFTY": allocations["NIFTY"], "BANKNIFTY": allocations["BANKNIFTY"]}
+            else:
+                target_weights = {"NIFTY": 0.0, "BANKNIFTY": 0.0}
 
-            # Calculate Transaction Friction
-            pos_diff = torch.cat([torch.tensor([0.0], device=device), torch.abs(positions[1:] - positions[:-1])])
-            rewards = (positions * future_returns) - (cost_bps * pos_diff)
+        sim_res = sim.step(timestamp_str=current_ts, prices=prices, target_weights=target_weights)
+        daily_logs.append(sim_res)
 
-            # GAE Calculation
-            advantages, returns_to_go = compute_gae(rewards, values, next_val)
-            adv_norm = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    final_val = sim.capital
+    total_return = (final_val - sim.initial_capital) / sim.initial_capital
+    max_dd = max([log["current_drawdown"] for log in daily_logs]) if daily_logs else 0.0
 
-            # Train Batch
-            loss = trainer.train_epoch_amp(
-                obs_batch.cpu(),
-                actions.unsqueeze(-1).cpu(),
-                log_probs.cpu(),
-                adv_norm.cpu(),
-                returns_to_go.cpu()
-            )
-            epoch_loss += loss
-            batch_count += 1
-            all_step_rewards.append(rewards.cpu().numpy())
-
-        # Metric Reporting
-        step_returns = np.concatenate(all_step_rewards)
-        mean_ret = np.mean(step_returns)
-        std_ret = np.std(step_returns) + 1e-8
-        annualized_sharpe = (mean_ret / std_ret) * np.sqrt(252 * 375)
-
-        avg_loss = epoch_loss / max(1, batch_count)
-        logger.info(
-            f"Epoch {epoch:02d}/{num_epochs:02d} | Loss: {avg_loss:.5f} | Step Return: {mean_ret*1e4:+.2f} bps | Sharpe: {annualized_sharpe:+.2f}"
-        )
-
-        if annualized_sharpe > best_sharpe:
-            best_sharpe = annualized_sharpe
-            torch.save(
-                {'epoch': epoch, 'model_state_dict': model.state_dict(), 'sharpe': best_sharpe},
-                "checkpoints/actor_critic_nifty_best.pt"
-            )
-            logger.info(f"Saved Checkpoint (Best Sharpe: {best_sharpe:.2f})")
-
-    logger.info("Pipeline Execution Complete.")
-
+    print("\n================ SYSTEM PERFORMANCE SUMMARY ================")
+    print(f" Initial Capital:       ₹{sim.initial_capital:,.2f}")
+    print(f" Final Portfolio Value: ₹{final_val:,.2f}")
+    print(f" Cumulative Return:     {total_return * 100:.2f}%")
+    print(f" Maximum Drawdown:      {max_dd * 100:.2f}% (Limit: 30.0%)")
+    print("============================================================")
 
 if __name__ == "__main__":
-    run_production_pipeline()
+    run_end_to_end_system()

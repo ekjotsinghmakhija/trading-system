@@ -1,4 +1,12 @@
 import os
+import sys
+from pathlib import Path
+
+# Add project root to sys.path
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import duckdb
 import torch
 import numpy as np
@@ -19,7 +27,7 @@ def prepare_tensors(df: pl.DataFrame, feature_cols: list, seq_len: int = 15):
 
     X_seq, Y_seq = [], []
     for i in range(seq_len, len(feature_matrix)):
-        X_seq.append(feature_matrix[i - seq_len:i].T)  # Shape: [Features, Seq_Len]
+        X_seq.append(feature_matrix[i - seq_len:i].T)
         Y_seq.append(target_returns[i])
 
     return torch.tensor(np.array(X_seq), dtype=torch.float32), torch.tensor(np.array(Y_seq), dtype=torch.float32)
@@ -33,14 +41,12 @@ def run_training_pipeline():
     banknifty_df = con.execute("SELECT * FROM banknifty_features_1m ORDER BY timestamp").pl().drop_nulls()
     con.close()
 
-    # Align rows on timestamp
     common_ts = nifty_df.select("timestamp").intersect(banknifty_df.select("timestamp"))
     nifty_df = nifty_df.join(common_ts, on="timestamp").sort("timestamp")
     banknifty_df = banknifty_df.join(common_ts, on="timestamp").sort("timestamp")
 
     feature_cols = [col for col in nifty_df.columns if col not in ["timestamp", "trading_date", "target_5m_return"]]
 
-    # Build State-Space Ledger for hazard detection
     ledger = FactorLedger()
     stats = ledger.build_ledger(nifty_df, feature_cols)
     print(f"[+] Factor Ledger Built: {stats}")
@@ -55,7 +61,7 @@ def run_training_pipeline():
     print(f"[+] Training on Device: {device}")
 
     fold = 1
-    for train_idx, test_idx in cpcv.split(nifty_df.slice(15)):  # Adjust offset for sequence window
+    for train_idx, test_idx in cpcv.split(nifty_df.slice(15)):
         print(f"\n--- CPCV Fold {fold} ---")
 
         X_n_tr, X_bn_tr, Y_tr = X_nifty[train_idx].to(device), X_banknifty[train_idx].to(device), Y_target[train_idx].to(device)
