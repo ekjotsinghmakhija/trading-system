@@ -4,19 +4,21 @@ import pandas as pd
 
 class StrictOptionSimEnv:
     """
-    Realistic trading simulation with fixed position sizing, transaction fees,
-    and strict step sequence execution to prevent lookahead bias.
+    Simulation environment built to prevent over-trading.
+    Includes explicit flip penalties, mandatory holding cooldowns,
+    and early reset on excessive drawdown.
     """
     def __init__(
         self,
         df: pd.DataFrame,
         feature_cols: list = None,
-        fee_rate: float = 0.0003,        # 0.03% fee
+        fee_rate: float = 0.0003,        # 0.03% base fee
         impact_coef: float = 0.0001,     # Impact cost
-        dead_zone: float = 0.05,         # Conviction barrier
-        holding_penalty: float = 0.00005,
+        dead_zone: float = 0.10,         # Minimum conviction barrier
+        churn_penalty: float = 0.001,    # Direct reward penalty per trade flip
+        cooldown_steps: int = 5,         # Mandatory bar delay between trade changes
         initial_capital: float = 50000.0,
-        max_position_size: float = 5000.0 # Maximum allocation per trade
+        max_position_size: float = 5000.0
     ):
         self.df = df.reset_index(drop=True)
 
@@ -28,7 +30,8 @@ class StrictOptionSimEnv:
         self.fee_rate = fee_rate
         self.impact_coef = impact_coef
         self.dead_zone = dead_zone
-        self.holding_penalty = holding_penalty
+        self.churn_penalty = churn_penalty
+        self.cooldown_steps = cooldown_steps
         self.initial_capital = initial_capital
         self.max_position_size = max_position_size
 
@@ -36,6 +39,7 @@ class StrictOptionSimEnv:
         self.max_steps = len(self.df) - 1
         self.current_position = 0.0
         self.equity = self.initial_capital
+        self.last_trade_step = -cooldown_steps
 
         self.history_capital = [self.equity]
         self.history_pnl = [0.0]
@@ -52,6 +56,7 @@ class StrictOptionSimEnv:
         self.current_step = np.random.randint(0, max(1, self.max_steps - 5000))
         self.current_position = 0.0
         self.equity = self.initial_capital
+        self.last_trade_step = -self.cooldown_steps
 
         self.history_capital = [self.equity]
         self.history_pnl = [0.0]
@@ -77,30 +82,41 @@ class StrictOptionSimEnv:
 
         action_val = float(raw_action[0]) if isinstance(raw_action, (np.ndarray, list)) else float(raw_action)
 
-        # Action mapping
+        # Check action threshold
         if abs(action_val) < self.dead_zone:
-            target_position = 0.0
+            proposed_position = 0.0
         else:
             sign = np.sign(action_val)
             scaled = (abs(action_val) - self.dead_zone) / (1.0 - self.dead_zone)
-            target_position = float(sign * np.clip(scaled, 0.0, 1.0))
+            proposed_position = float(sign * np.clip(scaled, 0.0, 1.0))
 
-        # Real step returns calculation
+        # Enforce holding cooldown constraint
+        pos_delta = abs(proposed_position - self.current_position)
+        is_cooldown_active = (self.current_step - self.last_trade_step) < self.cooldown_steps
+
+        if pos_delta > 1e-3 and is_cooldown_active:
+            # Block trade change if cooldown hasn't expired
+            target_position = self.current_position
+            pos_delta = 0.0
+        else:
+            target_position = proposed_position
+            if pos_delta > 1e-3:
+                self.last_trade_step = self.current_step
+
+        # Step forward and evaluate prices
         current_price = self.df.iloc[self.current_step]["close"]
         self.current_step += 1
         next_price = self.df.iloc[min(self.current_step, self.max_steps)]["close"]
 
         price_diff = next_price - current_price
-
-        # Absolute currency PnL based on position sizing instead of full multiplicative compounding
         trade_allocation = self.current_position * self.max_position_size
         raw_pnl = (trade_allocation / (current_price + 1e-8)) * price_diff
 
-        pos_delta = abs(target_position - self.current_position)
+        # Transaction Friction + Explicit Over-Trading Penalty
         turnover_cost = (pos_delta * self.fee_rate * self.max_position_size) + (self.impact_coef * (pos_delta ** 2))
-        holding_cost = abs(target_position) * self.holding_penalty * self.max_position_size
+        flip_penalty = (pos_delta * self.churn_penalty * self.max_position_size) if pos_delta > 1e-3 else 0.0
 
-        net_pnl = raw_pnl - turnover_cost - holding_cost
+        net_pnl = raw_pnl - turnover_cost
         self.current_position = target_position
         self.equity += net_pnl
 
@@ -109,19 +125,21 @@ class StrictOptionSimEnv:
         self.history_positions.append(self.current_position)
 
         terminated = bool(self.current_step >= self.max_steps)
-        truncated = bool(self.equity < (self.initial_capital * 0.5))
+        # Early restart: truncate if loss hits 15% (equity falls below ₹42,500)
+        truncated = bool(self.equity < (self.initial_capital * 0.85))
 
         info = {
             "pnl": net_pnl,
             "step_pnl": net_pnl,
             "turnover_cost": turnover_cost,
-            "trade_cost": turnover_cost,
+            "trade_cost": turnover_cost + flip_penalty,
             "position": self.current_position,
             "equity": self.equity,
             "capital": self.equity
         }
 
-        # Scaled step reward for stable gradient updates
-        normalized_reward = float(np.clip(net_pnl / 100.0, -10.0, 10.0))
+        # Reward formulation penalizing trade churning heavily
+        reward = (net_pnl - flip_penalty) / 100.0
+        normalized_reward = float(np.clip(reward, -10.0, 10.0))
 
         return self._get_observation(), normalized_reward, terminated, truncated, info
