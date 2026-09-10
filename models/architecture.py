@@ -25,18 +25,17 @@ class ChokuTemporalBlock(nn.Module):
 
 
 class ActorCriticTCNGRU(nn.Module):
-    def __init__(self, input_dim: int, action_dim: int = 1):
+    def __init__(self, input_dim: int = None, action_dim: int = 1):
         super().__init__()
-        self.input_dim = input_dim
         self.action_dim = action_dim
 
-        # Temporal Sequence Processing
+        # Temporal Sequence Extractor
         self.tcn = ChokuTemporalBlock(in_channels=1, out_channels=32, kernel_size=3, dilation=1)
         self.gru = nn.GRU(input_size=32, hidden_size=64, batch_first=True)
 
-        # Dense Representation Pipeline
+        # Dynamic Dense Layer - Automatically infers input vector length (handles N features + 1 position)
         self.fc_features = nn.Sequential(
-            nn.Linear(input_dim, 64),
+            nn.LazyLinear(64),
             nn.LayerNorm(64),
             nn.ReLU(),
             nn.Linear(64, 64),
@@ -44,10 +43,10 @@ class ActorCriticTCNGRU(nn.Module):
             nn.ReLU()
         )
 
-        # Policy & Value Output Heads
+        # Actor & Critic Heads
         self.actor_dense = nn.Linear(64 + 64, 64)
         self.actor_mean = nn.Linear(64, action_dim)
-        # Suppress standard deviation to log(-2.5) => std ≈ 0.082
+        # Low noise sampling initialization (std ~ 0.082)
         self.log_std = nn.Parameter(torch.ones(action_dim) * -2.5)
 
         self.critic_dense = nn.Linear(64 + 64, 64)
@@ -57,7 +56,7 @@ class ActorCriticTCNGRU(nn.Module):
         if x.dim() == 1:
             x = x.unsqueeze(0)
 
-        # Sequence Forward
+        # Sequence Path
         x_trans = x.unsqueeze(1)
         tcn_out = self.tcn(x_trans)
         tcn_permuted = tcn_out.permute(0, 2, 1)
@@ -65,11 +64,11 @@ class ActorCriticTCNGRU(nn.Module):
         gru_out, _ = self.gru(tcn_permuted)
         gru_feat = gru_out[:, -1, :]
 
-        # Dense Forward
+        # Dense Path (Dynamic Input Shape Adaptor)
         dense_feat = self.fc_features(x)
         combined = torch.cat([gru_feat, dense_feat], dim=-1)
 
-        # Actor / Critic Heads
+        # Actor and Value Heads
         act_hidden = F.relu(self.actor_dense(combined))
         action_mean = torch.tanh(self.actor_mean(act_hidden))
 

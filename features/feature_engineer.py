@@ -4,8 +4,8 @@ import numpy as np
 
 class FeatureEngine:
     """
-    Engine for computing 16 mathematically orthogonal, stationary, and normalized
-    market indicators using QR Gram-Schmidt decomposition for RL models.
+    Computes 16 stationary, uncorrelated indicators with optional QR Gram-Schmidt
+    orthogonalization to ensure strict input feature independence.
     """
     def __init__(self, apply_orthogonalization: bool = True):
         self.apply_orthogonalization = apply_orthogonalization
@@ -13,7 +13,6 @@ class FeatureEngine:
     def compute_features(self, df: pd.DataFrame) -> pd.DataFrame:
         data = df.copy()
 
-        # Ensure OHLCV columns exist
         for col in ["close", "high", "low", "volume"]:
             if col not in data.columns:
                 if col == "high": data["high"] = data["close"] * 1.001
@@ -27,13 +26,13 @@ class FeatureEngine:
 
         feat = pd.DataFrame(index=data.index)
 
-        # --- 1. Return Dynamics & Log Ratios (Features 1-3) ---
+        # --- 1. Return Dynamics & Log Ratios ---
         log_ret = np.log(close / close.shift(1)).fillna(0.0)
         feat["f01_log_ret_1"] = log_ret
         feat["f02_log_ret_5"] = np.log(close / close.shift(5)).fillna(0.0)
         feat["f03_log_ret_20"] = np.log(close / close.shift(20)).fillna(0.0)
 
-        # --- 2. Volatility Regimes (Features 4-6) ---
+        # --- 2. Volatility Regimes ---
         tr1 = high - low
         tr2 = (high - close.shift(1)).abs()
         tr3 = (low - close.shift(1)).abs()
@@ -44,7 +43,7 @@ class FeatureEngine:
         feat["f05_realized_vol_10"] = log_ret.rolling(10).std().fillna(0.0)
         feat["f06_parkinson_vol"] = (np.sqrt((1.0 / (4.0 * np.log(2.0))) * (np.log(high / low) ** 2)).rolling(10).mean()).fillna(0.0)
 
-        # --- 3. Momentum & Trend Oscillators (Features 7-10) ---
+        # --- 3. Momentum & Oscillators ---
         delta = close.diff()
         gain = (delta.where(delta > 0, 0)).rolling(14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
@@ -64,7 +63,7 @@ class FeatureEngine:
         rolling_std = log_ret.rolling(10).std()
         feat["f10_vol_adj_mom"] = (log_ret.rolling(10).mean() / (rolling_std + 1e-8)).fillna(0.0)
 
-        # --- 4. Mean Reversion & Spread (Features 11-13) ---
+        # --- 4. Mean Reversion & Spread ---
         sma_20 = close.rolling(20).mean()
         std_20 = close.rolling(20).std()
         feat["f11_bollinger_pct_b"] = (((close - (sma_20 - 2 * std_20)) / (4 * std_20 + 1e-8)) - 0.5).fillna(0.0)
@@ -72,7 +71,7 @@ class FeatureEngine:
         feat["f12_return_zscore"] = ((log_ret - log_ret.rolling(20).mean()) / (ret_std + 1e-8)).fillna(0.0)
         feat["f13_close_to_sma_ratio"] = ((close - sma_20) / (sma_20 + 1e-8)).fillna(0.0)
 
-        # --- 5. Volume & Flow Dynamics (Features 14-16) ---
+        # --- 5. Volume & Flow Dynamics ---
         vol_sma_20 = volume.rolling(20).mean()
         feat["f14_volume_ratio"] = ((volume - vol_sma_20) / (vol_sma_20 + 1e-8)).fillna(0.0)
 
@@ -80,12 +79,12 @@ class FeatureEngine:
         feat["f15_cmf_surrogate"] = (mf_multiplier * volume).rolling(10).mean() / (vol_sma_20 + 1e-8)
         feat["f16_price_vol_corr"] = log_ret.rolling(10).corr(volume.pct_change().fillna(0.0)).fillna(0.0)
 
-        # Standard Normalization (Robust Scaling)
+        # Normalize and clip
         feat_cols = list(feat.columns)
         feat = (feat - feat.mean()) / (feat.std() + 1e-8)
         feat = feat.clip(-5.0, 5.0).fillna(0.0)
 
-        # --- QR Gram-Schmidt Orthogonalization ---
+        # Apply Orthogonalization
         if self.apply_orthogonalization and len(feat) > len(feat_cols):
             X = feat.values
             Q, _ = np.linalg.qr(X)
@@ -95,7 +94,12 @@ class FeatureEngine:
         return feat
 
 
-def compute_uncorrelated_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Backward compatibility wrapper."""
+def generate_rich_indicator_dataset(df: pd.DataFrame = None) -> pd.DataFrame:
+    """Fallback generator function to preserve external API calls."""
+    if df is None:
+        dates = pd.date_range("2025-01-01", periods=20000, freq="1min")
+        price = 100.0 + np.cumsum(np.random.normal(0, 0.2, 20000))
+        df = pd.DataFrame({"close": price}, index=dates)
+
     engine = FeatureEngine(apply_orthogonalization=True)
     return engine.compute_features(df)
