@@ -20,10 +20,6 @@ def train_ppo_engine(
     eval_interval: int = 100_000,
     exp_name: str = "ppo_12m"
 ):
-    """
-    High-Throughput PPO Training Engine for Intraday Options Trading.
-    Configured for fine-grained policy gradients with low learning rates (1e-6 to 5e-7).
-    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     timestamp = int(time.time())
     run_id = f"{exp_name}_{timestamp}"
@@ -41,16 +37,13 @@ def train_ppo_engine(
         print(f"     GPU: {torch.cuda.get_device_name(0)} | VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
     print("=" * 60 + "\n")
 
-    # 1. Load Dataset
     processed_data_path = "data/processed/nifty_options_features.parquet"
     if not os.path.exists(processed_data_path):
-        # Fallback to duckdb or sample dataset if parquet path differs
         processed_data_path = "data/processed/features.parquet"
 
     if os.path.exists(processed_data_path):
         df = pd.read_parquet(processed_data_path)
     else:
-        # Generate dummy execution frame if dataset pipeline is running separately
         dates = pd.date_range("2024-01-01", periods=10000, freq="1min")
         df = pd.DataFrame({
             "close": np.sin(np.linspace(0, 100, 10000)) * 10 + 100,
@@ -62,20 +55,18 @@ def train_ppo_engine(
     feature_cols = [col for col in df.columns if col not in ["datetime", "date", "timestamp"]]
     env = StrictOptionSimEnv(df=df, feature_cols=feature_cols)
 
-    # 2. Instantiate Network & Optimizer
     input_dim = len(feature_cols)
     model = ActorCriticTCNGRU(input_dim=input_dim).to(device)
 
-    # Low learning rate range (3e-6 down to 5e-7) to prevent policy gradient explosion
-    initial_lr = 3e-6
-    min_lr = 5e-7
-    optimizer = optim.AdamW(model.parameters(), lr=initial_lr, weight_decay=1e-4)
+    # Calibrated LR & Stable Adam Parameters
+    initial_lr = 1e-5
+    min_lr = 1e-6
+    optimizer = optim.AdamW(model.parameters(), lr=initial_lr, weight_decay=1e-4, eps=1e-5)
 
-    # Hyperparameters
     gamma = 0.99
     gae_lambda = 0.95
     clip_eps = 0.2
-    entropy_coef = 0.02  # Higher entropy coefficient to force active exploration
+    entropy_coef = 0.03  # Stronger entropy regularization to keep actions diverse
     value_coef = 0.5
     batch_size = 2048
     n_epochs = 10
@@ -94,12 +85,10 @@ def train_ppo_engine(
     global_step = 0
 
     while global_step < total_timesteps:
-        # Linear LR decay from 3e-6 down to 5e-7
         lr_now = max(min_lr, initial_lr - (initial_lr - min_lr) * (global_step / total_timesteps))
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr_now
 
-        # --- Rollout Storage ---
         obs_buf, act_buf, logp_buf, rew_buf, val_buf, done_buf = [], [], [], [], [], []
 
         model.eval()
@@ -111,13 +100,16 @@ def train_ppo_engine(
                 action, log_prob, value = model.get_action(obs_tensor, deterministic=False)
 
             action_np = action.cpu().numpy()[0]
-            next_obs, reward, terminated, truncated, _ = env.step(action_np)
+            next_obs, raw_reward, terminated, truncated, _ = env.step(action_np)
             done = terminated or truncated
+
+            # SCALE REWARD: Normalize raw PnL values down by 1000x to prevent value gradient explosions
+            scaled_reward = float(np.clip(raw_reward / 1000.0, -10.0, 10.0))
 
             obs_buf.append(obs)
             act_buf.append(action_np)
             logp_buf.append(log_prob.cpu().numpy()[0])
-            rew_buf.append(reward)
+            rew_buf.append(scaled_reward)
             val_buf.append(value.cpu().numpy()[0][0])
             done_buf.append(done)
 
@@ -125,11 +117,10 @@ def train_ppo_engine(
             if done:
                 obs, _ = env.reset()
 
-            # Trigger Periodic Evaluation Pass
             if global_step % eval_interval == 0:
                 eval_callback.run_evaluation(global_step)
 
-        # --- GAE Advantage Calculation ---
+        # GAE Advantage Calculation
         with torch.no_grad():
             last_obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
             _, _, last_val = model.get_action(last_obs_tensor)
@@ -147,17 +138,14 @@ def train_ppo_engine(
             advantages[t] = gae
             returns[t] = advantages[t] + val_buf[t]
 
-        # Convert rollouts to tensors
         b_obs = torch.as_tensor(np.array(obs_buf), dtype=torch.float32, device=device)
         b_act = torch.as_tensor(np.array(act_buf), dtype=torch.float32, device=device)
         b_logp = torch.as_tensor(np.array(logp_buf), dtype=torch.float32, device=device)
         b_adv = torch.as_tensor(advantages, dtype=torch.float32, device=device)
         b_ret = torch.as_tensor(returns, dtype=torch.float32, device=device)
 
-        # Normalize advantages
         b_adv = (b_adv - b_adv.mean()) / (b_adv.std() + 1e-8)
 
-        # --- PPO Optimization Epochs ---
         model.train()
         dataset_size = rollout_steps
         indices = np.arange(dataset_size)
@@ -176,19 +164,14 @@ def train_ppo_engine(
 
                 new_logp, entropy, new_val = model.evaluate_actions(mb_obs, mb_act)
 
-                # Policy Loss
                 ratios = torch.exp(new_logp - mb_logp)
                 surr1 = ratios * mb_adv
                 surr2 = torch.clamp(ratios, 1.0 - clip_eps, 1.0 + clip_eps) * mb_adv
                 actor_loss = -torch.min(surr1, surr2).mean()
 
-                # Value Loss
-                critic_loss = torch.nn.functional.mse_loss(new_val.squeeze(-1), mb_ret)
-
-                # Entropy Loss
+                critic_loss = F.mse_loss(new_val.squeeze(-1), mb_ret)
                 entropy_loss = -entropy.mean()
 
-                # Total Loss
                 total_loss = actor_loss + value_coef * critic_loss + entropy_coef * entropy_loss
 
                 optimizer.zero_grad()
@@ -202,7 +185,7 @@ def train_ppo_engine(
         writer.add_scalar("train/entropy", -entropy_loss.item(), global_step)
 
     writer.close()
-    print("[✓] 12 Million Step Training Pipeline Successfully Finished!")
+    print("[✓] Training Complete.")
 
 
 def train_ppo_12m_steps():
