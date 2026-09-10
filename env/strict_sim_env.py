@@ -10,14 +10,19 @@ class StrictOptionSimEnv:
     def __init__(
         self,
         df: pd.DataFrame,
-        feature_cols: list,
+        feature_cols: list = None,
         fee_rate: float = 0.0003,       # 0.03% base fee
         impact_coef: float = 0.0001,    # Quadratic market impact coefficient
         dead_zone: float = 0.15,        # Minimum conviction barrier
         holding_penalty: float = 0.0001 # Holding friction
     ):
         self.df = df.reset_index(drop=True)
-        self.feature_cols = feature_cols
+
+        if feature_cols is None:
+            self.feature_cols = [c for c in self.df.columns if c != "close"]
+        else:
+            self.feature_cols = feature_cols
+
         self.fee_rate = fee_rate
         self.impact_coef = impact_coef
         self.dead_zone = dead_zone
@@ -41,11 +46,10 @@ class StrictOptionSimEnv:
     def _get_observation(self):
         row = self.df.iloc[self.current_step]
         obs = row[self.feature_cols].values.astype(np.float32)
-        # Append active position state to feature vector
         return np.append(obs, np.float32(self.current_position))
 
     def step(self, raw_action: np.ndarray):
-        action_val = float(raw_action[0]) if isinstance(raw_action, np.ndarray) else float(raw_action)
+        action_val = float(raw_action[0]) if isinstance(raw_action, (np.ndarray, list)) else float(raw_action)
 
         # 1. Action Dead Zone Mapping
         if abs(action_val) < self.dead_zone:
