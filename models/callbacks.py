@@ -1,27 +1,47 @@
 import os
+import psutil
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
 
-class ModelCheckpointCallback:
+class PerformanceMonitorCallback:
     """
-    Monitors portfolio equity and saves optimal model state checkpoints.
+    Streams hardware performance and internal training state metrics to TensorBoard.
     """
-    def __init__(self, save_dir: str = "models/checkpoints", log_dir: str = "tensorboard_logs"):
-        self.save_dir = save_dir
-        os.makedirs(self.save_dir, exist_ok=True)
+    def __init__(self, log_dir: str = "tensorboard_logs", checkpoint_dir: str = "models/checkpoints"):
         self.writer = SummaryWriter(log_dir=log_dir)
-        self.best_equity = -float("inf")
+        self.checkpoint_dir = checkpoint_dir
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        self.best_sharpe = -float("inf")
 
-    def on_epoch_end(self, epoch: int, current_equity: float, loss: float, model: torch.nn.Module):
-        self.writer.add_scalar("Portfolio/Equity", current_equity, epoch)
-        self.writer.add_scalar("Train/Loss", loss, epoch)
+    def log_metrics(self, epoch: int, metrics: dict):
+        # 1. Hardware Utilization Diagnostics
+        if torch.cuda.is_available():
+            vram_mb = torch.cuda.memory_allocated() / (1024 * 1024)
+            vram_reserved = torch.cuda.memory_reserved() / (1024 * 1024)
+            self.writer.add_scalar("Hardware/VRAM_Allocated_MB", vram_mb, epoch)
+            self.writer.add_scalar("Hardware/VRAM_Reserved_MB", vram_reserved, epoch)
 
-        if current_equity > self.best_equity:
-            self.best_equity = current_equity
-            save_path = os.path.join(self.save_dir, "best_model.pt")
-            torch.save(model.state_dict(), save_path)
-            print(f"[💾 CHECKPOINT] Peak Equity ₹{current_equity:,.2f} -> Model saved to {save_path}")
+        cpu_usage = psutil.cpu_percent()
+        ram_usage = psutil.virtual_memory().percent
+        self.writer.add_scalar("Hardware/CPU_Usage_Percent", cpu_usage, epoch)
+        self.writer.add_scalar("Hardware/RAM_Usage_Percent", ram_usage, epoch)
+
+        # 2. RL & Training Diagnostics
+        for key, val in metrics.items():
+            if isinstance(val, (int, float)):
+                self.writer.add_scalar(f"RL_Engine/{key}", val, epoch)
+
+    def save_checkpoint(self, model, optimizer, epoch: int, sharpe: float):
+        if sharpe > self.best_sharpe:
+            self.best_sharpe = sharpe
+            path = os.path.join(self.checkpoint_dir, "best_model.pt")
+            torch.save({
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "sharpe": sharpe
+            }, path)
 
     def close(self):
         self.writer.close()
