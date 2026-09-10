@@ -1,29 +1,28 @@
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 
 
 class HighThroughputPPOTrainer:
     """
-    Production PPO Trainer optimized for CUDA AMP, kernel fusion,
-    and adaptive local minima escape mechanisms.
+    Production PPO Trainer using PyTorch 2.x Unified AMP API
+    and Lion/AdamW momentum updates.
     """
     def __init__(self, model, env, lr: float = 3e-6, device: str = "cuda"):
-        self.device = torch.device(device)
+        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.env = env
+        self.model = model.to(self.device)
 
-        # Compile model for CUDA kernel fusion
-        self.model = torch.compile(model.to(self.device), mode="reduce-overhead")
-
-        # Lion optimizer for uniform momentum-based step sizes
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=1e-4)
-        self.scaler = GradScaler()
+
+        # PyTorch 2.x API for GradScaler
+        self.use_cuda = self.device.type == "cuda"
+        self.scaler = GradScaler("cuda", enabled=self.use_cuda)
         self.entropy_coef = 0.02
 
     def train_epoch_amp(self, obs_batch, act_batch, logp_batch, adv_batch, rtg_batch):
-        self.model.train()
+        self.model.train()  # Enable training mode for backprop
 
-        # Asynchronous non-blocking transfer to GPU VRAM
         obs_t = obs_batch.to(self.device, non_blocking=True)
         act_t = act_batch.to(self.device, non_blocking=True)
         logp_t = logp_batch.to(self.device, non_blocking=True)
@@ -32,8 +31,11 @@ class HighThroughputPPOTrainer:
 
         self.optimizer.zero_grad(set_to_none=True)
 
-        # Mixed Precision Forward Pass
-        with autocast(dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16):
+        # PyTorch 2.x API for autocast
+        device_type = "cuda" if self.use_cuda else "cpu"
+        dtype = torch.bfloat16 if (self.use_cuda and torch.cuda.is_bf16_supported()) else torch.float16
+
+        with autocast(device_type=device_type, dtype=dtype, enabled=self.use_cuda):
             new_logp, entropy, values = self.model.evaluate_actions(obs_t, act_t)
             ratios = torch.exp(new_logp - logp_t)
 
@@ -46,11 +48,15 @@ class HighThroughputPPOTrainer:
 
             total_loss = actor_loss + 0.5 * critic_loss + self.entropy_coef * entropy_loss
 
-        # Scaled Gradient Backpropagation
-        self.scaler.scale(total_loss).backward()
-        self.scaler.unscale_(self.optimizer)
-        nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
+        if self.use_cuda:
+            self.scaler.scale(total_loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            total_loss.backward()
+            nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
+            self.optimizer.step()
 
         return total_loss.item()
