@@ -26,9 +26,10 @@ def run_end_to_end_system():
     banknifty_df = con.execute("SELECT * FROM banknifty_features_1m ORDER BY timestamp").pl().drop_nulls()
     con.close()
 
-    common_ts = nifty_df.select("timestamp").intersect(banknifty_df.select("timestamp"))
-    nifty_df = nifty_df.join(common_ts, on="timestamp").sort("timestamp")
-    banknifty_df = banknifty_df.join(common_ts, on="timestamp").sort("timestamp")
+    # Align on common timestamps using inner join
+    common_ts = nifty_df.select("timestamp").join(banknifty_df.select("timestamp"), on="timestamp", how="inner").unique()
+    nifty_df = nifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
+    banknifty_df = banknifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
 
     feature_cols = [c for c in nifty_df.columns if c not in ["timestamp", "trading_date", "target_5m_return"]]
 
