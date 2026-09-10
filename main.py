@@ -22,6 +22,47 @@ if torch.cuda.is_available():
     torch.set_float32_matmul_precision('high')
     torch.backends.cudnn.benchmark = True
 
+def load_and_preprocess_data(con):
+    nifty_df = con.execute("SELECT * FROM nifty_features_1m ORDER BY timestamp").pl()
+    banknifty_df = con.execute("SELECT * FROM banknifty_features_1m ORDER BY timestamp").pl()
+
+    if nifty_df.schema["timestamp"] == pl.Utf8:
+        nifty_df = nifty_df.with_columns(pl.col("timestamp").str.to_datetime(strict=False))
+    else:
+        nifty_df = nifty_df.with_columns(pl.col("timestamp").cast(pl.Datetime))
+
+    if banknifty_df.schema["timestamp"] == pl.Utf8:
+        banknifty_df = banknifty_df.with_columns(pl.col("timestamp").str.to_datetime(strict=False))
+    else:
+        banknifty_df = banknifty_df.with_columns(pl.col("timestamp").cast(pl.Datetime))
+
+    common_ts = nifty_df.select("timestamp").join(banknifty_df.select("timestamp"), on="timestamp", how="inner").unique()
+    nifty_df = nifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
+    banknifty_df = banknifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
+
+    meta_cols = {"timestamp", "trading_date", "target_5m_return"}
+    candidate_cols = sorted(list((set(nifty_df.columns) & set(banknifty_df.columns)) - meta_cols))
+
+    feature_cols = []
+    for col in candidate_cols:
+        nifty_nulls = nifty_df.select(pl.col(col).null_count()).item() / len(nifty_df)
+        bank_nulls = banknifty_df.select(pl.col(col).null_count()).item() / len(banknifty_df)
+        if nifty_nulls < 0.20 and bank_nulls < 0.20:
+            feature_cols.append(col)
+
+    nifty_df = nifty_df.with_columns([pl.col(c).ffill().bfill() for c in feature_cols])
+    banknifty_df = banknifty_df.with_columns([pl.col(c).ffill().bfill() for c in feature_cols])
+
+    req_cols = feature_cols + ["target_5m_return"]
+    nifty_df = nifty_df.drop_nulls(subset=req_cols)
+    banknifty_df = banknifty_df.drop_nulls(subset=req_cols)
+
+    common_ts = nifty_df.select("timestamp").join(banknifty_df.select("timestamp"), on="timestamp", how="inner").unique()
+    nifty_df = nifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
+    banknifty_df = banknifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
+
+    return nifty_df, banknifty_df, feature_cols
+
 def run_end_to_end_system():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_cpus = os.cpu_count() or 4
@@ -30,27 +71,8 @@ def run_end_to_end_system():
 
     print("[2/5] Connecting to DuckDB & Loading Feature Space...")
     con = duckdb.connect(DB_PATH)
-    nifty_df = con.execute("SELECT * FROM nifty_features_1m ORDER BY timestamp").pl()
-    banknifty_df = con.execute("SELECT * FROM banknifty_features_1m ORDER BY timestamp").pl()
+    nifty_df, banknifty_df, feature_cols = load_and_preprocess_data(con)
     con.close()
-
-    nifty_df = nifty_df.with_columns(pl.col("timestamp").cast(pl.Utf8))
-    banknifty_df = banknifty_df.with_columns(pl.col("timestamp").cast(pl.Utf8))
-
-    common_ts = nifty_df.select("timestamp").join(banknifty_df.select("timestamp"), on="timestamp", how="inner").unique()
-    nifty_df = nifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
-    banknifty_df = banknifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
-
-    meta_cols = {"timestamp", "trading_date", "target_5m_return"}
-    feature_cols = sorted(list((set(nifty_df.columns) & set(banknifty_df.columns)) - meta_cols))
-
-    required_cols = feature_cols + ["target_5m_return"]
-    nifty_df = nifty_df.drop_nulls(subset=required_cols)
-    banknifty_df = banknifty_df.drop_nulls(subset=required_cols)
-
-    common_ts = nifty_df.select("timestamp").join(banknifty_df.select("timestamp"), on="timestamp", how="inner").unique()
-    nifty_df = nifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
-    banknifty_df = banknifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
 
     print(f"      └─ Dataset Loaded: {len(nifty_df)} time steps | Feature Dimension: {len(feature_cols)}")
 

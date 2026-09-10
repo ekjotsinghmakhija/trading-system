@@ -18,13 +18,17 @@ class FactorLedger:
         self.is_hazard_state = None
 
     def build_ledger(self, df: pl.DataFrame, feature_cols: List[str]) -> Dict[str, int]:
+        if len(df) == 0:
+            raise ValueError("DataFrame is empty; cannot build Factor Ledger.")
+
         # Filter for hazard states
         hazard_df = df.filter(pl.col("target_5m_return") <= self.hazard_threshold)
 
         # Fall back to 5th percentile if threshold yields no rows
         if len(hazard_df) == 0:
             q_val = df.select(pl.col("target_5m_return").quantile(0.05)).item()
-            hazard_df = df.filter(pl.col("target_5m_return") <= q_val)
+            if q_val is not None:
+                hazard_df = df.filter(pl.col("target_5m_return") <= q_val)
 
         if len(hazard_df) == 0:
             hazard_df = df
@@ -32,8 +36,8 @@ class FactorLedger:
         self.state_matrix = hazard_df.select(feature_cols).to_numpy().astype(np.float32)
         self.is_hazard_state = np.ones(len(self.state_matrix), dtype=bool)
 
-        # Parallelize KNN fit across all CPU threads
-        n_neighbors = min(self.k_neighbors, len(self.state_matrix))
+        # Enforce minimum 1 neighbor to avoid sklearn validation crash
+        n_neighbors = max(1, min(self.k_neighbors, len(self.state_matrix)))
         self.nn_model = NearestNeighbors(n_neighbors=n_neighbors, algorithm='auto', n_jobs=-1)
         self.nn_model.fit(self.state_matrix)
 

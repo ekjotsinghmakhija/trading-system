@@ -45,33 +45,61 @@ def prepare_tensors(df: pl.DataFrame, feature_cols: list, seq_len: int = 15):
 
     return torch.tensor(np.array(X_seq), dtype=torch.float32), torch.tensor(np.array(Y_seq), dtype=torch.float32)
 
+def load_and_preprocess_data(con):
+    nifty_df = con.execute("SELECT * FROM nifty_features_1m ORDER BY timestamp").pl()
+    banknifty_df = con.execute("SELECT * FROM banknifty_features_1m ORDER BY timestamp").pl()
+
+    # Standardize timestamp datatypes
+    if nifty_df.schema["timestamp"] == pl.Utf8:
+        nifty_df = nifty_df.with_columns(pl.col("timestamp").str.to_datetime(strict=False))
+    else:
+        nifty_df = nifty_df.with_columns(pl.col("timestamp").cast(pl.Datetime))
+
+    if banknifty_df.schema["timestamp"] == pl.Utf8:
+        banknifty_df = banknifty_df.with_columns(pl.col("timestamp").str.to_datetime(strict=False))
+    else:
+        banknifty_df = banknifty_df.with_columns(pl.col("timestamp").cast(pl.Datetime))
+
+    # Initial timestamp alignment
+    common_ts = nifty_df.select("timestamp").join(banknifty_df.select("timestamp"), on="timestamp", how="inner").unique()
+    nifty_df = nifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
+    banknifty_df = banknifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
+
+    # Find overlapping non-metadata feature columns
+    meta_cols = {"timestamp", "trading_date", "target_5m_return"}
+    candidate_cols = sorted(list((set(nifty_df.columns) & set(banknifty_df.columns)) - meta_cols))
+
+    # Exclude columns with high missingness (> 20% nulls)
+    feature_cols = []
+    for col in candidate_cols:
+        nifty_nulls = nifty_df.select(pl.col(col).null_count()).item() / len(nifty_df)
+        bank_nulls = banknifty_df.select(pl.col(col).null_count()).item() / len(banknifty_df)
+        if nifty_nulls < 0.20 and bank_nulls < 0.20:
+            feature_cols.append(col)
+
+    # Forward-fill and backward-fill indicator warmup periods
+    nifty_df = nifty_df.with_columns([pl.col(c).ffill().bfill() for c in feature_cols])
+    banknifty_df = banknifty_df.with_columns([pl.col(c).ffill().bfill() for c in feature_cols])
+
+    # Drop remaining nulls in required columns (target_5m_return)
+    req_cols = feature_cols + ["target_5m_return"]
+    nifty_df = nifty_df.drop_nulls(subset=req_cols)
+    banknifty_df = banknifty_df.drop_nulls(subset=req_cols)
+
+    # Final timestamp alignment
+    common_ts = nifty_df.select("timestamp").join(banknifty_df.select("timestamp"), on="timestamp", how="inner").unique()
+    nifty_df = nifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
+    banknifty_df = banknifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
+
+    return nifty_df, banknifty_df, feature_cols
+
 def run_training_pipeline():
     device, num_cpus = setup_hardware()
 
     print("[+] Connecting to DuckDB...")
     con = duckdb.connect(DB_PATH)
-    nifty_df = con.execute("SELECT * FROM nifty_features_1m ORDER BY timestamp").pl()
-    banknifty_df = con.execute("SELECT * FROM banknifty_features_1m ORDER BY timestamp").pl()
+    nifty_df, banknifty_df, feature_cols = load_and_preprocess_data(con)
     con.close()
-
-    nifty_df = nifty_df.with_columns(pl.col("timestamp").cast(pl.Utf8))
-    banknifty_df = banknifty_df.with_columns(pl.col("timestamp").cast(pl.Utf8))
-
-    common_ts = nifty_df.select("timestamp").join(banknifty_df.select("timestamp"), on="timestamp", how="inner").unique()
-    nifty_df = nifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
-    banknifty_df = banknifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
-
-    # Intersect column sets to guarantee 1:1 schema parity between both symbols
-    meta_cols = {"timestamp", "trading_date", "target_5m_return"}
-    feature_cols = sorted(list((set(nifty_df.columns) & set(banknifty_df.columns)) - meta_cols))
-
-    required_cols = feature_cols + ["target_5m_return"]
-    nifty_df = nifty_df.drop_nulls(subset=required_cols)
-    banknifty_df = banknifty_df.drop_nulls(subset=required_cols)
-
-    common_ts = nifty_df.select("timestamp").join(banknifty_df.select("timestamp"), on="timestamp", how="inner").unique()
-    nifty_df = nifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
-    banknifty_df = banknifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
 
     print(f"[+] Aligned Dataset Size: {len(nifty_df)} rows | Feature Dimension: {len(feature_cols)}")
 
