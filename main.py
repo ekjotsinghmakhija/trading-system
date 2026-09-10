@@ -15,32 +15,37 @@ def run_production_pipeline():
 
     db_path = "data/duckdb/market_data.duckdb"
     if not os.path.exists(db_path):
-        raise FileNotFoundError(f"Database file not found at {db_path}. Please run data/process_raw.py first.")
+        raise FileNotFoundError(f"Database file not found at {db_path}. Run data/process_raw.py first.")
 
-    # 1. Fetch raw data from DuckDB database
-    logger.info(f"Loading market data from DuckDB database ({db_path})...")
     conn = duckdb.connect(db_path)
     df_raw = conn.execute("SELECT * FROM ohlcv_bars ORDER BY timestamp ASC").df()
     conn.close()
+    logger.info(f"Loaded {len(df_raw):,} market bars into memory.")
 
-    total_raw_rows = len(df_raw)
-    logger.info(f"Loaded {total_raw_rows:,} market bars into memory.")
-
-    # 2. Compute 18 alpha features using FeatureEngineer
     logger.info("Computing alpha feature matrix...")
     engineer = FeatureEngineer()
     df_features = engineer.compute_18_alpha_matrix(df_raw).dropna().reset_index(drop=True)
 
-    # Exclude metadata columns
     exclude_cols = {'timestamp', 'date', 'symbol', 'open', 'high', 'low', 'close', 'volume', 'oi'}
     feature_cols = [c for c in df_features.columns if c.lower() not in exclude_cols]
 
     logger.info(f"Extracted {len(feature_cols)} feature channels across {len(df_features):,} processed rows.")
 
-    # Convert features to tensor
-    obs_data = torch.tensor(df_features[feature_cols].values, dtype=torch.float32)
+    # Convert features to float32 tensor
+    raw_obs = torch.tensor(df_features[feature_cols].values, dtype=torch.float32)
 
-    # 3. Instantiate model architecture and trainer
+    # Sanitize and Standardize features (Z-Score Normalization + Clipping)
+    obs_clean = torch.nan_to_num(raw_obs, nan=0.0, posinf=0.0, neginf=0.0)
+    mean = obs_clean.mean(dim=0, keepdim=True)
+    std = obs_clean.std(dim=0, keepdim=True) + 1e-8
+
+    # Clip inputs to [-5.0, 5.0] to prevent gradient explosions in AMP
+    obs_data = torch.clamp((obs_clean - mean) / std, min=-5.0, max=5.0)
+
+    # Verify tensor safety
+    assert not torch.isnan(obs_data).any(), "Input features contain NaN values!"
+    assert not torch.isinf(obs_data).any(), "Input features contain Inf values!"
+
     input_dim = len(feature_cols)
     model = ActorCriticTCNGRU(input_dim=input_dim, action_dim=1)
     trainer = HighThroughputPPOTrainer(model=model, env=None)
@@ -51,7 +56,6 @@ def run_production_pipeline():
     num_epochs = 5
     total_steps = len(obs_data)
 
-    # 4. Main Epoch Optimization Loop
     for epoch in range(1, num_epochs + 1):
         epoch_loss = 0.0
         batch_count = 0
@@ -60,7 +64,6 @@ def run_production_pipeline():
             end_idx = start_idx + rollout_horizon
             obs_batch = obs_data[start_idx:end_idx]
 
-            # Generate step rollout tensors matching sequence batch shapes
             act_batch = torch.zeros((rollout_horizon, 1), dtype=torch.float32)
             logp_batch = torch.zeros((rollout_horizon,), dtype=torch.float32)
             adv_batch = torch.randn((rollout_horizon,), dtype=torch.float32)
