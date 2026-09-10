@@ -14,7 +14,7 @@ class FeatureEngine:
     def __init__(self, df: pd.DataFrame):
         self.df = df.copy().sort_values("timestamp").reset_index(drop=True)
 
-    def calculate_cluster_1_price_momentum((self) -> pd.DataFrame:
+    def calculate_cluster_1_price_momentum(self) -> pd.DataFrame:
         """Cluster 1: Technical & Trend Momentum (6 Features)"""
         close = self.df["close"]
         high = self.df["high"]
@@ -52,7 +52,6 @@ class FeatureEngine:
 
     def calculate_cluster_2_options_microstructure(self) -> pd.DataFrame:
         """Cluster 2: Options Microstructure & Positioning (6 Features)"""
-        # Ensure fallback column defaults if dataset lacks level-2 derivative feeds
         call_oi = self.df.get("call_open_interest", pd.Series(1.0, index=self.df.index))
         put_oi = self.df.get("put_open_interest", pd.Series(1.0, index=self.df.index))
         call_iv = self.df.get("call_iv", pd.Series(0.15, index=self.df.index))
@@ -89,7 +88,7 @@ class FeatureEngine:
         vega = self.df.get("net_vega", pd.Series(0.0, index=self.df.index))
         theta = self.df.get("net_theta", pd.Series(0.0, index=self.df.index))
 
-        # 13. Level-2 Order Flow Imbalance (OFI: (Bid - Ask) / (Bid + Ask))
+        # 13. Level-2 Order Flow Imbalance (OFI)
         total_depth = bid_qty + ask_qty
         self.df["feat_ofi"] = safe_divide(bid_qty - ask_qty, total_depth).clip(-1.0, 1.0)
 
@@ -105,7 +104,7 @@ class FeatureEngine:
         # 17. Net Vega Exposure
         self.df["feat_net_vega"] = vega
 
-        # 18. Theta Decay Velocity (Theta per minute ratio)
+        # 18. Theta Decay Velocity
         self.df["feat_theta_decay_rate"] = safe_divide(theta, self.df["close"]).fillna(0.0)
 
         return self.df
@@ -116,12 +115,11 @@ class FeatureEngine:
         self.calculate_cluster_2_options_microstructure()
         self.calculate_cluster_3_greeks_orderflow()
 
-        # Drop warm-up NA rows caused by rolling windows (14 & 20)
+        # Drop warm-up NA rows caused by rolling windows
         self.df = self.df.dropna().reset_index(drop=True)
         return self.df
 
 if __name__ == "__main__":
-    # Smoke Test with dummy OHLCV data
     dates = pd.date_range("2026-09-01 09:15:00", periods=100, freq="1min", tz="UTC")
     dummy_df = pd.DataFrame({
         "timestamp": dates,
@@ -134,7 +132,5 @@ if __name__ == "__main__":
 
     engine = FeatureEngine(dummy_df)
     matrix = engine.build_feature_matrix()
-
     feature_cols = [c for c in matrix.columns if c.startswith("feat_")]
     print(f"[✓] Successfully generated {len(feature_cols)} features across {len(matrix)} rows.")
-    print("Features list:", feature_cols)
