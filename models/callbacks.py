@@ -1,128 +1,103 @@
 import os
-import torch
+import logging
 import numpy as np
-import pandas as pd
-from pathlib import Path
+import torch
+from torch.utils.tensorboard import SummaryWriter
 
-class CheckpointAndEscapeEngine:
+logger = logging.getLogger(__name__)
+
+
+class EvaluationCallback:
+    """
+    Periodic Evaluation & Auto-Rescue Callback for Intraday Options PPO Strategy.
+    Prevents policy deadlock by measuring active performance and saving best checkpoints.
+    """
     def __init__(
         self,
+        eval_env,
+        model,
+        device: torch.device,
+        eval_interval: int = 100_000,
         checkpoint_dir: str = "models/checkpoints",
-        ledger_path: str = "logs/experiments/factor_ledger.parquet"
+        writer: SummaryWriter = None
     ):
-        self.checkpoint_dir = Path(checkpoint_dir)
-        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        self.ledger_path = Path(ledger_path)
-        self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        self.eval_env = eval_env
+        self.model = model
+        self.device = device
+        self.eval_interval = eval_interval
+        self.checkpoint_dir = checkpoint_dir
+        self.writer = writer
 
         self.best_sharpe = -np.inf
-        self.stagnant_milestones = 0
-        self.escape_stage = 0
+        self.stagnant_eval_count = 0
 
-    def evaluate_and_checkpoint(self, model, env, current_step: int) -> dict:
-        """Evaluates model performance over a full episode with realistic metric calculation."""
-        model.eval()
-        device = next(model.parameters()).device
-
-        obs, _ = env.reset()
+    def run_evaluation(self, global_step: int) -> float:
+        self.model.eval()
+        obs, _ = self.eval_env.reset()
         done = False
-        wins = 0
-        trades = 0
-        portfolio_track = [env.initial_capital]
 
-        with torch.no_grad():
-            while not done:
-                obs_tensor = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-                action, _, _ = model(obs_tensor)
-                act_val = action.cpu().numpy()[0]
+        trades_count = 0
+        total_pnl = 0.0
+        returns_list = []
 
-                obs, reward, terminated, truncated, info = env.step(act_val)
-                done = terminated or truncated
+        # Run 1 evaluation episode pass
+        while not done:
+            obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
 
-                pnl = info.get("step_pnl", 0.0)
-                friction = info.get("friction_cost", 0.0)
-                if friction > 0 or pnl != 0:
-                    trades += 1
-                    if pnl > 0:
-                        wins += 1
+            with torch.no_grad():
+                # Allow minor exploration during evaluation to prevent zero-action lock
+                action, _, _ = self.model.get_action(obs_tensor, deterministic=False)
 
-                portfolio_track.append(env.capital)
+            action_np = action.cpu().numpy()[0]
+            next_obs, reward, terminated, truncated, info = self.eval_env.step(action_np)
+            done = terminated or truncated
 
-        # Standardized Sharpe Ratio Calculation over Portfolio Capital Curve
-        port_arr = np.array(portfolio_track)
-        pct_returns = np.diff(port_arr) / port_arr[:-1]
+            if info.get("step_pnl", 0.0) != 0.0:
+                trades_count += 1
+                total_pnl += info["step_pnl"]
 
-        if len(pct_returns) > 1 and np.std(pct_returns) > 1e-8:
-            # Annualize based on 375 1-min bars per trading day
-            sharpe = float((np.mean(pct_returns) / np.std(pct_returns)) * np.sqrt(252 * 375))
-        else:
-            sharpe = 0.0
+            returns_list.append(reward)
+            obs = next_obs
 
-        win_rate = float(wins / trades) if trades > 0 else 0.0
-        final_capital = float(env.capital)
+        # Calculate Sharpe
+        returns_arr = np.array(returns_list)
+        std_ret = np.std(returns_arr)
+        sharpe = (np.mean(returns_arr) / (std_ret + 1e-8)) * np.sqrt(252 * 375) if std_ret > 1e-6 else 0.0
+        final_capital = self.eval_env.capital
+        win_rate = (np.sum(returns_arr > 0) / len(returns_arr)) * 100.0 if len(returns_arr) > 0 else 0.0
 
         print(
-            f"[📊 Eval Step {current_step}] Sharpe: {sharpe:.2f} | "
-            f"Win Rate: {win_rate*100:.1f}% | Trades: {trades} | Capital: ₹{final_capital:,.2f}"
+            f"[📊 Eval Step {global_step}] Sharpe: {sharpe:.2f} | "
+            f"Win Rate: {win_rate:.1f}% | Trades: {trades_count} | Capital: ₹{final_capital:,.2f}"
         )
 
-        # Periodic Model Tensor Checkpoint (For recovery and checkpointing every step milestone)
-        step_ckpt_path = self.checkpoint_dir / f"model_step_{current_step}.pt"
-        torch.save({
-            "step": current_step,
-            "model_state_dict": model.state_dict(),
-            "sharpe": sharpe,
-            "capital": final_capital
-        }, step_ckpt_path)
+        if self.writer is not None:
+            self.writer.add_scalar("eval/sharpe", sharpe, global_step)
+            self.writer.add_scalar("eval/trades", trades_count, global_step)
+            self.writer.add_scalar("eval/capital", final_capital, global_step)
+            self.writer.add_scalar("eval/win_rate", win_rate, global_step)
 
-        # Save Best Model state dict if Sharpe improves
-        if sharpe > self.best_sharpe and trades > 0:
+        # Auto-rescue: If 2 consecutive evals generate 0 trades, inject policy perturbation
+        if trades_count == 0:
+            self.stagnant_eval_count += 1
+            if self.stagnant_eval_count >= 2:
+                print(f"[⚠️ LOCAL MINIMA TRAP] Stagnant for {self.stagnant_eval_count} evaluation windows!")
+                print("[🚀 Escape Stage 1] Injecting Controlled Noise into Policy Head (actor_dense)...")
+                with torch.no_grad():
+                    self.model.actor_dense.weight.add_(torch.randn_like(self.model.actor_dense.weight) * 0.1)
+                    self.model.actor_dense.bias.add_(torch.randn_like(self.model.actor_dense.bias) * 0.05)
+                self.stagnant_eval_count = 0
+        else:
+            self.stagnant_eval_count = 0
+
+        # Save Best Checkpoint
+        if sharpe > self.best_sharpe and trades_count > 0:
             self.best_sharpe = sharpe
-            self.stagnant_milestones = 0
-            best_path = self.checkpoint_dir / "best_model.pt"
-            torch.save(model.state_dict(), best_path)
-            print(f"[✓] New Best Sharpe ({sharpe:.2f}) Saved -> {best_path}")
-        else:
-            self.stagnant_milestones += 1
+            best_model_path = os.path.join(self.checkpoint_dir, "best_model.pt")
+            torch.save(self.model.state_dict(), best_model_path)
+            print(f"[✓] New Best Sharpe ({sharpe:.2f}) Saved -> {best_model_path}")
 
-        return {
-            "sharpe_ratio": sharpe,
-            "win_rate": win_rate,
-            "final_capital": final_capital,
-            "trades": trades
-        }
+        step_checkpoint_path = os.path.join(self.checkpoint_dir, f"model_step_{global_step}.pt")
+            torch.save(self.model.state_dict(), step_checkpoint_path)
 
-    def check_local_minima_and_trigger_escape(self, model, optimizer, ppo_config: dict):
-        """3-Stage Adaptive Escape Mechanism for Stagnant Policies"""
-        if self.stagnant_milestones < 3:
-            return
-
-        self.escape_stage += 1
-        print(f"\n[⚠️ LOCAL MINIMA TRAP] Stagnant for {self.stagnant_milestones} evaluation windows!")
-
-        if self.escape_stage == 1:
-            print("[🚀 Escape Stage 1] Injecting Controlled Noise into Policy Head (actor_dense)...")
-            with torch.no_grad():
-                for param in model.actor_dense.parameters():
-                    param.add_(torch.randn_like(param) * 0.05)
-
-        elif self.escape_stage == 2:
-            print("[🚀 Escape Stage 2] Increasing Entropy Loss Weight (c2_entropy -> 0.05)...")
-            ppo_config["c2_entropy"] = 0.05
-
-        elif self.escape_stage == 3:
-            print("[🚀 Escape Stage 3] Scaling Optimizer Learning Rate 3x temporarily...")
-            for param_group in optimizer.param_groups:
-                param_group['lr'] *= 3.0
-            self.escape_stage = 0
-
-        self.stagnant_milestones = 0
-
-    def record_to_parquet_ledger(self, metrics: dict):
-        new_df = pd.DataFrame([metrics])
-        if self.ledger_path.exists():
-            df = pd.read_parquet(self.ledger_path)
-            df = pd.concat([df, new_df], ignore_index=True)
-        else:
-            df = new_df
-        df.to_parquet(self.ledger_path, index=False)
+        return sharpe

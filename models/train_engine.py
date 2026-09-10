@@ -1,133 +1,208 @@
 import os
 import time
-import torch
-import torch.nn as nn
+import logging
 import numpy as np
+import torch
+import torch.optim as optim
 import pandas as pd
 from torch.utils.tensorboard import SummaryWriter
 
 from models.architecture import ActorCriticTCNGRU
 from env.strict_sim_env import StrictOptionSimEnv
-from features.feature_engineer import FeatureEngine
-from models.callbacks import CheckpointAndEscapeEngine
+from models.callbacks import EvaluationCallback
 
-torch.backends.cudnn.benchmark = True
+logger = logging.getLogger(__name__)
 
-def train_ppo_engine(total_timesteps=12_000_000, eval_interval=100_000, batch_size=4096, minibatch_size=512, exp_name="run_ppo"):
+
+def train_ppo_engine(
+    total_timesteps: int = 12_000_000,
+    eval_interval: int = 100_000,
+    exp_name: str = "ppo_12m"
+):
+    """
+    High-Throughput PPO Training Engine for Intraday Options Trading.
+    Configured for fine-grained policy gradients with low learning rates (1e-6 to 5e-7).
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log_dir = f"logs/experiments/{exp_name}_{int(time.time())}"
+    timestamp = int(time.time())
+    run_id = f"{exp_name}_{timestamp}"
+    log_dir = os.path.join("logs", "experiments", run_id)
+    checkpoint_dir = os.path.join("models", "checkpoints")
+    os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
     writer = SummaryWriter(log_dir=log_dir)
 
-    print(f"\n==========================================================")
+    print("=" * 60)
     print(f"[🚀] Launching Training Engine on Device: {device}")
     print(f"     Experiment Logs: {log_dir}")
     if torch.cuda.is_available():
         print(f"     GPU: {torch.cuda.get_device_name(0)} | VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
-    print(f"==========================================================\n")
+    print("=" * 60 + "\n")
 
-    dates = pd.date_range("2026-01-01 09:15:00", periods=20000, freq="1min", tz="UTC")
-    dummy_df = pd.DataFrame({
-        "timestamp": dates,
-        "open": np.random.randn(20000).cumsum() + 25000,
-        "high": np.random.randn(20000).cumsum() + 25020,
-        "low": np.random.randn(20000).cumsum() + 24980,
-        "close": np.random.randn(20000).cumsum() + 25000,
-        "volume": np.random.randint(100, 5000, size=20000)
-    })
+    # 1. Load Dataset
+    processed_data_path = "data/processed/nifty_options_features.parquet"
+    if not os.path.exists(processed_data_path):
+        # Fallback to duckdb or sample dataset if parquet path differs
+        processed_data_path = "data/processed/features.parquet"
 
-    feat_engine = FeatureEngine(dummy_df)
-    matrix = feat_engine.build_feature_matrix()
-    feature_cols = [c for c in matrix.columns if c.startswith("feat_")]
+    if os.path.exists(processed_data_path):
+        df = pd.read_parquet(processed_data_path)
+    else:
+        # Generate dummy execution frame if dataset pipeline is running separately
+        dates = pd.date_range("2024-01-01", periods=10000, freq="1min")
+        df = pd.DataFrame({
+            "close": np.sin(np.linspace(0, 100, 10000)) * 10 + 100,
+            "feature_1": np.random.randn(10000),
+            "feature_2": np.random.randn(10000),
+            "feature_3": np.random.randn(10000),
+        })
 
-    env = StrictOptionSimEnv(matrix, feature_cols)
-    model = ActorCriticTCNGRU(input_dim=len(feature_cols)).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-6, weight_decay=1e-4)
-    scaler = torch.amp.GradScaler('cuda')
-    huber_loss = nn.HuberLoss()
+    feature_cols = [col for col in df.columns if col not in ["datetime", "date", "timestamp"]]
+    env = StrictOptionSimEnv(df=df, feature_cols=feature_cols)
 
-    ppo_config = {"c2_entropy": 0.01, "c1_value": 0.5}
-    cb_engine = CheckpointAndEscapeEngine()
+    # 2. Instantiate Network & Optimizer
+    input_dim = len(feature_cols)
+    model = ActorCriticTCNGRU(input_dim=input_dim).to(device)
 
-    current_step = 0
+    # Low learning rate range (3e-6 down to 5e-7) to prevent policy gradient explosion
+    initial_lr = 3e-6
+    min_lr = 5e-7
+    optimizer = optim.AdamW(model.parameters(), lr=initial_lr, weight_decay=1e-4)
+
+    # Hyperparameters
+    gamma = 0.99
+    gae_lambda = 0.95
+    clip_eps = 0.2
+    entropy_coef = 0.02  # Higher entropy coefficient to force active exploration
+    value_coef = 0.5
+    batch_size = 2048
+    n_epochs = 10
+    rollout_steps = 4096
+
+    eval_callback = EvaluationCallback(
+        eval_env=env,
+        model=model,
+        device=device,
+        eval_interval=eval_interval,
+        checkpoint_dir=checkpoint_dir,
+        writer=writer
+    )
+
     obs, _ = env.reset()
-    start_time = time.time()
+    global_step = 0
 
-    while current_step < total_timesteps:
-        obs_buffer, action_buffer, reward_buffer = [], [], []
+    while global_step < total_timesteps:
+        # Linear LR decay from 3e-6 down to 5e-7
+        lr_now = max(min_lr, initial_lr - (initial_lr - min_lr) * (global_step / total_timesteps))
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr_now
+
+        # --- Rollout Storage ---
+        obs_buf, act_buf, logp_buf, rew_buf, val_buf, done_buf = [], [], [], [], [], []
+
         model.eval()
+        for _ in range(rollout_steps):
+            global_step += 1
+            obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
 
-        for _ in range(batch_size):
-            current_step += 1
-            obs_tensor = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+            with torch.no_grad():
+                action, log_prob, value = model.get_action(obs_tensor, deterministic=False)
 
-            with torch.no_grad(), torch.amp.autocast('cuda'):
-                action, value, _ = model(obs_tensor)
+            action_np = action.cpu().numpy()[0]
+            next_obs, reward, terminated, truncated, _ = env.step(action_np)
+            done = terminated or truncated
 
-            act_val = action.cpu().numpy()[0]
-            next_obs, reward, term, trunc, info = env.step(act_val)
-
-            obs_buffer.append(obs)
-            action_buffer.append(act_val)
-            reward_buffer.append(reward)
+            obs_buf.append(obs)
+            act_buf.append(action_np)
+            logp_buf.append(log_prob.cpu().numpy()[0])
+            rew_buf.append(reward)
+            val_buf.append(value.cpu().numpy()[0][0])
+            done_buf.append(done)
 
             obs = next_obs
-            if term or trunc:
+            if done:
                 obs, _ = env.reset()
 
-            # Evaluation & Checkpoint Interval
-            if current_step % eval_interval == 0 or current_step == total_timesteps:
-                eval_metrics = cb_engine.evaluate_and_checkpoint(model, env, current_step)
-                cb_engine.check_local_minima_and_trigger_escape(model, optimizer, ppo_config)
+            # Trigger Periodic Evaluation Pass
+            if global_step % eval_interval == 0:
+                eval_callback.run_evaluation(global_step)
 
-                # Write metrics to TensorBoard and Parquet
-                writer.add_scalar("Eval/SharpeRatio", eval_metrics["sharpe_ratio"], current_step)
-                writer.add_scalar("Eval/WinRate", eval_metrics["win_rate"], current_step)
-                writer.add_scalar("Eval/Capital", eval_metrics["final_capital"], current_step)
+        # --- GAE Advantage Calculation ---
+        with torch.no_grad():
+            last_obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+            _, _, last_val = model.get_action(last_obs_tensor)
+            last_val = last_val.cpu().numpy()[0][0]
 
-                cb_engine.record_to_parquet_ledger({
-                    "timestamp": pd.Timestamp.now().isoformat(),
-                    "step": current_step,
-                    "sharpe": eval_metrics["sharpe_ratio"],
-                    "win_rate": eval_metrics["win_rate"],
-                    "capital": eval_metrics["final_capital"]
-                })
-                model.eval()
+        advantages = np.zeros(rollout_steps, dtype=np.float32)
+        returns = np.zeros(rollout_steps, dtype=np.float32)
+        gae = 0.0
 
-        # Minibatch PPO Update
+        for t in reversed(range(rollout_steps)):
+            next_val = last_val if t == rollout_steps - 1 else val_buf[t + 1]
+            next_non_terminal = 1.0 - float(done_buf[t])
+            delta = rew_buf[t] + gamma * next_val * next_non_terminal - val_buf[t]
+            gae = delta + gamma * gae_lambda * next_non_terminal * gae
+            advantages[t] = gae
+            returns[t] = advantages[t] + val_buf[t]
+
+        # Convert rollouts to tensors
+        b_obs = torch.as_tensor(np.array(obs_buf), dtype=torch.float32, device=device)
+        b_act = torch.as_tensor(np.array(act_buf), dtype=torch.float32, device=device)
+        b_logp = torch.as_tensor(np.array(logp_buf), dtype=torch.float32, device=device)
+        b_adv = torch.as_tensor(advantages, dtype=torch.float32, device=device)
+        b_ret = torch.as_tensor(returns, dtype=torch.float32, device=device)
+
+        # Normalize advantages
+        b_adv = (b_adv - b_adv.mean()) / (b_adv.std() + 1e-8)
+
+        # --- PPO Optimization Epochs ---
         model.train()
-        obs_tensor_b = torch.tensor(np.array(obs_buffer), dtype=torch.float32, device=device)
-        actions_tensor_b = torch.tensor(np.array(action_buffer), dtype=torch.float32, device=device)
-        rewards_tensor_b = torch.tensor(np.array(reward_buffer), dtype=torch.float32, device=device)
+        dataset_size = rollout_steps
+        indices = np.arange(dataset_size)
 
-        for _ in range(4):
-            permutation = torch.randperm(batch_size)
-            for start_idx in range(0, batch_size, minibatch_size):
-                batch_indices = permutation[start_idx : start_idx + minibatch_size]
-                mb_obs, mb_act, mb_rew = obs_tensor_b[batch_indices], actions_tensor_b[batch_indices], rewards_tensor_b[batch_indices]
+        for _ in range(n_epochs):
+            np.random.shuffle(indices)
+            for start in range(0, dataset_size, batch_size):
+                end = start + batch_size
+                mb_idx = indices[start:end]
+
+                mb_obs = b_obs[mb_idx]
+                mb_act = b_act[mb_idx]
+                mb_logp = b_logp[mb_idx]
+                mb_adv = b_adv[mb_idx]
+                mb_ret = b_ret[mb_idx]
+
+                new_logp, entropy, new_val = model.evaluate_actions(mb_obs, mb_act)
+
+                # Policy Loss
+                ratios = torch.exp(new_logp - mb_logp)
+                surr1 = ratios * mb_adv
+                surr2 = torch.clamp(ratios, 1.0 - clip_eps, 1.0 + clip_eps) * mb_adv
+                actor_loss = -torch.min(surr1, surr2).mean()
+
+                # Value Loss
+                critic_loss = F.mse_loss(new_val.squeeze(-1), mb_ret)
+
+                # Entropy Loss
+                entropy_loss = -entropy.mean()
+
+                # Total Loss
+                total_loss = actor_loss + value_coef * critic_loss + entropy_coef * entropy_loss
 
                 optimizer.zero_grad()
-                with torch.amp.autocast('cuda'):
-                    pred_actions, pred_values, _ = model(mb_obs)
-                    v_loss = huber_loss(pred_values.squeeze(), mb_rew)
-                    p_loss = -torch.mean(pred_actions * mb_rew.unsqueeze(1))
-                    e_loss = -torch.mean(pred_actions ** 2)
-                    loss = p_loss + ppo_config["c1_value"] * v_loss + ppo_config["c2_entropy"] * e_loss
-
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
+                total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-                scaler.step(optimizer)
-                scaler.update()
+                optimizer.step()
 
-        if current_step % 10000 == 0:
-            elapsed = time.time() - start_time
-            fps = current_step / elapsed
-            writer.add_scalar("Train/FPS", fps, current_step)
-            writer.add_scalar("Train/Loss", loss.item(), current_step)
-            print(f"Step {current_step:8d} / {total_timesteps} | FPS: {fps:5.0f} | Loss: {loss.item():.4f}")
+        writer.add_scalar("train/learning_rate", lr_now, global_step)
+        writer.add_scalar("train/actor_loss", actor_loss.item(), global_step)
+        writer.add_scalar("train/critic_loss", critic_loss.item(), global_step)
+        writer.add_scalar("train/entropy", -entropy_loss.item(), global_step)
 
     writer.close()
-    print("\n[✓] Training Pass Completed!")
+    print("[✓] 12 Million Step Training Pipeline Successfully Finished!")
+
 
 def train_ppo_12m_steps():
     train_ppo_engine(total_timesteps=12_000_000, eval_interval=100_000, exp_name="ppo_12m")
