@@ -20,7 +20,6 @@ from features.factor_ledger import FactorLedger
 
 DB_PATH = "data/duckdb/market_data.duckdb"
 
-# Enable CUDA TF32 matmul and cuDNN benchmarking
 if torch.cuda.is_available():
     torch.set_float32_matmul_precision('high')
     torch.backends.cudnn.benchmark = True
@@ -62,7 +61,9 @@ def run_training_pipeline():
     nifty_df = nifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
     banknifty_df = banknifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
 
-    feature_cols = [col for col in nifty_df.columns if col not in ["timestamp", "trading_date", "target_5m_return"]]
+    # Intersect column sets to guarantee 1:1 schema parity between both symbols
+    meta_cols = {"timestamp", "trading_date", "target_5m_return"}
+    feature_cols = sorted(list((set(nifty_df.columns) & set(banknifty_df.columns)) - meta_cols))
 
     required_cols = feature_cols + ["target_5m_return"]
     nifty_df = nifty_df.drop_nulls(subset=required_cols)

@@ -41,7 +41,8 @@ def run_end_to_end_system():
     nifty_df = nifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
     banknifty_df = banknifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
 
-    feature_cols = [c for c in nifty_df.columns if c not in ["timestamp", "trading_date", "target_5m_return"]]
+    meta_cols = {"timestamp", "trading_date", "target_5m_return"}
+    feature_cols = sorted(list((set(nifty_df.columns) & set(banknifty_df.columns)) - meta_cols))
 
     required_cols = feature_cols + ["target_5m_return"]
     nifty_df = nifty_df.drop_nulls(subset=required_cols)
@@ -51,7 +52,7 @@ def run_end_to_end_system():
     nifty_df = nifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
     banknifty_df = banknifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
 
-    print(f"      └─ Dataset Loaded: {len(nifty_df)} time steps.")
+    print(f"      └─ Dataset Loaded: {len(nifty_df)} time steps | Feature Dimension: {len(feature_cols)}")
 
     print("[3/5] Initializing Factor Ledger & Hazard Memory...")
     ledger = FactorLedger(hazard_threshold=-0.0015, target_threshold=0.0020, k_neighbors=25)
