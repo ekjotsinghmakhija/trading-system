@@ -1,126 +1,59 @@
-import numpy as np
-import pandas as pd
+import torch
+import torch.nn as nn
+from torch.distributions import Normal
 
 
-class StrictOptionSimEnv:
+class ActorCriticTCNGRU(nn.Module):
     """
-    Simulated trading environment featuring action dead-zones, market impact,
-    linear/quadratic transaction costs, and step-by-step metric history tracking.
+    Combined Actor-Critic network with high action exploration standard deviation.
     """
-    def __init__(
-        self,
-        df: pd.DataFrame,
-        feature_cols: list = None,
-        fee_rate: float = 0.0003,       # 0.03% base fee
-        impact_coef: float = 0.0001,    # Quadratic market impact
-        dead_zone: float = 0.05,        # Lowered to encourage early trade execution
-        holding_penalty: float = 0.00005, # Mild friction
-        initial_capital: float = 50000.0  # Set starting portfolio capital to ₹50,000
-    ):
-        self.df = df.reset_index(drop=True)
+    def __init__(self, input_dim: int, action_dim: int = 1):
+        super().__init__()
 
-        if feature_cols is None:
-            self.feature_cols = [c for c in self.df.columns if c != "close"]
-        else:
-            self.feature_cols = feature_cols
+        self.feature_net = nn.Sequential(
+            nn.Linear(input_dim + 1, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU()
+        )
 
-        self.fee_rate = fee_rate
-        self.impact_coef = impact_coef
-        self.dead_zone = dead_zone
-        self.holding_penalty = holding_penalty
-        self.initial_capital = initial_capital
+        # Actor Network
+        self.actor_dense = nn.Linear(128, action_dim)
+        # log_std set to -0.8 (~0.45 std dev) to break dead-zone inertia
+        self.log_std = nn.Parameter(torch.ones(action_dim) * -0.8)
 
-        self.current_step = 0
-        self.max_steps = len(self.df) - 1
-        self.current_position = 0.0
-        self.equity = self.initial_capital
+        # Critic Network
+        self.critic_dense = nn.Linear(128, 1)
 
-        # History Tracking
-        self.history_capital = [self.equity]
-        self.history_pnl = [0.0]
-        self.history_positions = [0.0]
+    def forward(self, x):
+        features = self.feature_net(x)
+        return features
 
-    @property
-    def capital(self) -> float:
-        return self.equity
+    def get_action(self, obs_tensor, deterministic=False):
+        features = self.forward(obs_tensor)
+        mean = torch.tanh(self.actor_dense(features))
+        value = self.critic_dense(features)
 
-    def reset(self, seed: int = None):
-        if seed is not None:
-            np.random.seed(seed)
+        if deterministic:
+            return mean, torch.tensor([0.0], device=obs_tensor.device), value
 
-        self.current_step = np.random.randint(0, max(1, self.max_steps - 5000))
-        self.current_position = 0.0
-        self.equity = self.initial_capital
+        std = torch.exp(self.log_std)
+        dist = Normal(mean, std)
+        action = dist.sample()
+        action = torch.clamp(action, -1.0, 1.0)
+        log_prob = dist.log_prob(action).sum(axis=-1)
 
-        self.history_capital = [self.equity]
-        self.history_pnl = [0.0]
-        self.history_positions = [0.0]
+        return action, log_prob, value
 
-        return self._get_observation(), {}
+    def evaluate_actions(self, obs_tensor, action_tensor):
+        features = self.forward(obs_tensor)
+        mean = torch.tanh(self.actor_dense(features))
+        value = self.critic_dense(features)
 
-    def _get_observation(self):
-        safe_step = min(self.current_step, self.max_steps)
-        row = self.df.iloc[safe_step]
-        obs = row[self.feature_cols].values.astype(np.float32)
-        return np.append(obs, np.float32(self.current_position))
+        std = torch.exp(self.log_std)
+        dist = Normal(mean, std)
 
-    def step(self, raw_action: np.ndarray):
-        # Index Guard
-        if self.current_step >= self.max_steps:
-            obs = self._get_observation()
-            info = {
-                "pnl": 0.0,
-                "step_pnl": 0.0,
-                "turnover_cost": 0.0,
-                "trade_cost": 0.0,
-                "position": self.current_position,
-                "equity": self.equity,
-                "capital": self.equity
-            }
-            return obs, 0.0, True, False, info
+        log_prob = dist.log_prob(action_tensor).sum(axis=-1)
+        entropy = dist.entropy().sum(axis=-1)
 
-        action_val = float(raw_action[0]) if isinstance(raw_action, (np.ndarray, list)) else float(raw_action)
-
-        # Dead Zone Action Mapping
-        if abs(action_val) < self.dead_zone:
-            target_position = 0.0
-        else:
-            sign = np.sign(action_val)
-            scaled = (abs(action_val) - self.dead_zone) / (1.0 - self.dead_zone)
-            target_position = float(sign * np.clip(scaled, 0.0, 1.0))
-
-        # Returns and Friction
-        current_price = self.df.iloc[self.current_step]["close"]
-        self.current_step += 1
-        next_price = self.df.iloc[min(self.current_step, self.max_steps)]["close"]
-
-        price_return = (next_price - current_price) / (current_price + 1e-8)
-        raw_pnl = self.current_position * price_return
-
-        pos_delta = abs(target_position - self.current_position)
-        turnover_cost = (pos_delta * self.fee_rate) + (self.impact_coef * (pos_delta ** 2))
-        holding_cost = abs(target_position) * self.holding_penalty
-
-        step_reward = raw_pnl - turnover_cost - holding_cost
-        self.current_position = target_position
-        self.equity *= (1.0 + step_reward)
-
-        # Record History
-        self.history_capital.append(self.equity)
-        self.history_pnl.append(raw_pnl)
-        self.history_positions.append(self.current_position)
-
-        terminated = bool(self.current_step >= self.max_steps)
-        truncated = bool(self.equity < (self.initial_capital * 0.5))
-
-        info = {
-            "pnl": raw_pnl,
-            "step_pnl": raw_pnl,
-            "turnover_cost": turnover_cost,
-            "trade_cost": turnover_cost,
-            "position": self.current_position,
-            "equity": self.equity,
-            "capital": self.equity
-        }
-
-        return self._get_observation(), float(step_reward * 100.0), terminated, truncated, info
+        return log_prob, entropy, value
