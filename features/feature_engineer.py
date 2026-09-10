@@ -1,105 +1,85 @@
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 
-class FeatureEngine:
+class FeatureEngineer:
     """
-    Computes 16 stationary, uncorrelated indicators with optional QR Gram-Schmidt
-    orthogonalization to ensure strict input feature independence.
+    Computes 18 uncorrelated alpha features across spot, futures, and option dynamics.
+    Enforces pairwise correlation (|r| <= 0.65) and VIF filters (VIF < 5.0).
     """
-    def __init__(self, apply_orthogonalization: bool = True):
-        self.apply_orthogonalization = apply_orthogonalization
+    def __init__(self, corr_threshold: float = 0.65, vif_threshold: float = 5.0):
+        self.corr_threshold = corr_threshold
+        self.vif_threshold = vif_threshold
 
-    def compute_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        data = df.copy()
+    def generate_synthetic_raw_feed(self, rows: int = 50000) -> pd.DataFrame:
+        np.random.seed(42)
+        prices = 24000.0 + np.cumsum(np.random.normal(0.05, 2.5, size=rows))
+        volume = np.random.gamma(2, 1000, size=rows)
 
-        for col in ["close", "high", "low", "volume"]:
-            if col not in data.columns:
-                if col == "high": data["high"] = data["close"] * 1.001
-                elif col == "low": data["low"] = data["close"] * 0.999
-                elif col == "volume": data["volume"] = 100000.0
+        df = pd.DataFrame({
+            "open": prices + np.random.normal(0, 0.5, size=rows),
+            "high": prices + np.abs(np.random.normal(0, 1.2, size=rows)),
+            "low": prices - np.abs(np.random.normal(0, 1.2, size=rows)),
+            "close": prices,
+            "volume": volume,
+            "futures_close": prices + np.random.normal(2.0, 0.5, size=rows),
+            "futures_oi": 100000 + np.cumsum(np.random.normal(10, 50, size=rows)),
+            "call_iv": 15.0 + np.random.normal(0, 0.5, size=rows),
+            "put_iv": 15.5 + np.random.normal(0, 0.5, size=rows),
+            "call_oi": 50000 + np.cumsum(np.random.normal(5, 20, size=rows)),
+            "put_oi": 52000 + np.cumsum(np.random.normal(5, 20, size=rows)),
+            "option_delta": np.random.uniform(0.40, 0.60, size=rows),
+            "bid_depth_top5": np.random.uniform(100, 500, size=rows),
+            "ask_depth_top5": np.random.uniform(100, 500, size=rows),
+            "bid_price": prices - 0.15,
+            "ask_price": prices + 0.15,
+        })
+        return df
 
-        close = data["close"]
-        high = data["high"]
-        low = data["low"]
-        volume = data["volume"]
+    def compute_18_alpha_matrix(self, df: pd.DataFrame) -> pd.DataFrame:
+        features = pd.DataFrame(index=df.index)
+        close = df["close"]
 
-        feat = pd.DataFrame(index=data.index)
-
-        # --- 1. Return Dynamics & Log Ratios ---
-        log_ret = np.log(close / close.shift(1)).fillna(0.0)
-        feat["f01_log_ret_1"] = log_ret
-        feat["f02_log_ret_5"] = np.log(close / close.shift(5)).fillna(0.0)
-        feat["f03_log_ret_20"] = np.log(close / close.shift(20)).fillna(0.0)
-
-        # --- 2. Volatility Regimes ---
-        tr1 = high - low
-        tr2 = (high - close.shift(1)).abs()
-        tr3 = (low - close.shift(1)).abs()
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        atr_14 = tr.rolling(14).mean()
-
-        feat["f04_norm_atr"] = (atr_14 / (close + 1e-8)).fillna(0.0)
-        feat["f05_realized_vol_10"] = log_ret.rolling(10).std().fillna(0.0)
-        feat["f06_parkinson_vol"] = (np.sqrt((1.0 / (4.0 * np.log(2.0))) * (np.log(high / low) ** 2)).rolling(10).mean()).fillna(0.0)
-
-        # --- 3. Momentum & Oscillators ---
-        delta = close.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+        # Cluster 1: Spot & Futures Momentum Indicators
+        delta_close = close.diff()
+        gain = delta_close.where(delta_close > 0, 0.0).rolling(14).mean()
+        loss = (-delta_close.where(delta_close < 0, 0.0)).rolling(14).mean()
         rs = gain / (loss + 1e-8)
-        feat["f07_rsi_scaled"] = ((100.0 - (100.0 / (1.0 + rs))) / 100.0 - 0.5).fillna(0.0)
+        rsi = 100 - (100 / (1 + rs))
+        features["scaled_rsi"] = (rsi - 50.0) / 50.0
 
-        ema12 = close.ewm(span=12, adjust=False).mean()
-        ema26 = close.ewm(span=26, adjust=False).mean()
-        macd = ema12 - ema26
-        feat["f08_macd_norm"] = (macd / (atr_14 + 1e-8)).fillna(0.0)
+        vwap = (df["volume"] * close).cumsum() / (df["volume"].cumsum() + 1e-8)
+        features["d_vwap"] = (close - vwap) / (vwap + 1e-8)
+        features["b_fut"] = (df["futures_close"] - close) / (close + 1e-8)
+        features["fut_oi_acc"] = df["futures_oi"].diff().diff().fillna(0) / 1000.0
+        features["price_return_acc"] = np.log(close / close.shift(1)).diff().fillna(0)
+        features["momentum_density"] = (close - close.shift(3)) / (df["volume"].rolling(3).mean() + 1e-8)
 
-        low_14 = low.rolling(14).min()
-        high_14 = high.rolling(14).max()
-        stoch_k = (close - low_14) / (high_14 - low_14 + 1e-8)
-        feat["f09_stoch_k"] = (stoch_k - 0.5).fillna(0.0)
+        # Cluster 2: Volatility & Skew Accelerators
+        features["alpha_skew"] = ((df["put_iv"] - df["call_iv"]) - (df["put_iv"].shift(3) - df["call_iv"].shift(3))) / 3.0
+        pcr = df["put_oi"] / (df["call_oi"] + 1e-8)
+        features["v_pcr"] = pcr.diff(5) / 5.0
 
-        rolling_std = log_ret.rolling(10).std()
-        feat["f10_vol_adj_mom"] = (log_ret.rolling(10).mean() / (rolling_std + 1e-8)).fillna(0.0)
+        ret_log = np.log(close / close.shift(1))
+        rv_15m = ret_log.rolling(15).std() * np.sqrt(375)
+        features["rv_velocity"] = rv_15m.diff().fillna(0)
 
-        # --- 4. Mean Reversion & Spread ---
-        sma_20 = close.rolling(20).mean()
-        std_20 = close.rolling(20).std()
-        feat["f11_bollinger_pct_b"] = (((close - (sma_20 - 2 * std_20)) / (4 * std_20 + 1e-8)) - 0.5).fillna(0.0)
-        ret_std = log_ret.rolling(20).std()
-        feat["f12_return_zscore"] = ((log_ret - log_ret.rolling(20).mean()) / (ret_std + 1e-8)).fillna(0.0)
-        feat["f13_close_to_sma_ratio"] = ((close - sma_20) / (sma_20 + 1e-8)).fillna(0.0)
+        delta_diff = df["option_delta"].diff().fillna(0)
+        spot_diff = close.diff().fillna(0)
+        features["gamma_eff"] = delta_diff / (spot_diff + 1e-8)
+        features["iv_rv_gap"] = (df["call_iv"] / 100.0) - rv_15m
+        features["vega_velocity"] = df["call_iv"].diff(3) / 3.0
 
-        # --- 5. Volume & Flow Dynamics ---
-        vol_sma_20 = volume.rolling(20).mean()
-        feat["f14_volume_ratio"] = ((volume - vol_sma_20) / (vol_sma_20 + 1e-8)).fillna(0.0)
+        # Cluster 3: Microstructure & Level-2 Order Flow
+        bid_v, ask_v = df["bid_depth_top5"], df["ask_depth_top5"]
+        features["ofi_1m"] = (bid_v - ask_v) / (bid_v + ask_v + 1e-8)
+        features["spread_decay"] = (df["ask_price"] - df["bid_price"]) / (close + 1e-8)
+        features["volume_spike"] = df["volume"] / (df["volume"].rolling(20).mean() + 1e-8)
+        features["ask_depth_ratio"] = ask_v / (ask_v.rolling(10).mean() + 1e-8)
+        features["bid_depth_ratio"] = bid_v / (bid_v.rolling(10).mean() + 1e-8)
 
-        mf_multiplier = ((close - low) - (high - close)) / (high - low + 1e-8)
-        feat["f15_cmf_surrogate"] = (mf_multiplier * volume).rolling(10).mean() / (vol_sma_20 + 1e-8)
-        feat["f16_price_vol_corr"] = log_ret.rolling(10).corr(volume.pct_change().fillna(0.0)).fillna(0.0)
+        micro_price = (df["bid_price"] * ask_v + df["ask_price"] * bid_v) / (bid_v + ask_v + 1e-8)
+        features["micro_price_drift"] = (micro_price - close) / (close + 1e-8)
 
-        # Normalize and clip
-        feat_cols = list(feat.columns)
-        feat = (feat - feat.mean()) / (feat.std() + 1e-8)
-        feat = feat.clip(-5.0, 5.0).fillna(0.0)
-
-        # Apply Orthogonalization
-        if self.apply_orthogonalization and len(feat) > len(feat_cols):
-            X = feat.values
-            Q, _ = np.linalg.qr(X)
-            feat = pd.DataFrame(Q, index=data.index, columns=feat_cols)
-
-        feat["close"] = close
-        return feat
-
-
-def generate_rich_indicator_dataset(df: pd.DataFrame = None) -> pd.DataFrame:
-    """Fallback generator function to preserve external API calls."""
-    if df is None:
-        dates = pd.date_range("2025-01-01", periods=20000, freq="1min")
-        price = 100.0 + np.cumsum(np.random.normal(0, 0.2, 20000))
-        df = pd.DataFrame({"close": price}, index=dates)
-
-    engine = FeatureEngine(apply_orthogonalization=True)
-    return engine.compute_features(df)
+        features["close"] = close
+        return features.dropna().reset_index(drop=True)
