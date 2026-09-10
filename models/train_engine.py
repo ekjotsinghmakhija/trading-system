@@ -4,6 +4,7 @@ import logging
 import numpy as np
 import torch
 import torch.optim as optim
+import torch.nn.functional as F
 import pandas as pd
 from torch.utils.tensorboard import SummaryWriter
 
@@ -182,7 +183,7 @@ def train_ppo_engine(
                 actor_loss = -torch.min(surr1, surr2).mean()
 
                 # Value Loss
-                critic_loss = F.mse_loss(new_val.squeeze(-1), mb_ret)
+                critic_loss = torch.nn.functional.mse_loss(new_val.squeeze(-1), mb_ret)
 
                 # Entropy Loss
                 entropy_loss = -entropy.mean()
