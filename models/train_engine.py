@@ -8,20 +8,20 @@ class HighThroughputPPOTrainer:
     Production PPO Trainer using PyTorch 2.x Unified AMP API
     and Lion/AdamW momentum updates.
     """
-    def __init__(self, model, env, lr: float = 3e-6, device: str = "cuda"):
+    def __init__(self, model, env=None, lr: float = 3e-6, device: str = "cuda"):
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.env = env
         self.model = model.to(self.device)
 
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=1e-4)
 
-        # PyTorch 2.x API for GradScaler
+        # PyTorch 2.x Unified AMP GradScaler
         self.use_cuda = self.device.type == "cuda"
         self.scaler = GradScaler("cuda", enabled=self.use_cuda)
         self.entropy_coef = 0.02
 
     def train_epoch_amp(self, obs_batch, act_batch, logp_batch, adv_batch, rtg_batch):
-        self.model.train()  # Enable training mode for backprop
+        self.model.train()  # Set model to training mode
 
         obs_t = obs_batch.to(self.device, non_blocking=True)
         act_t = act_batch.to(self.device, non_blocking=True)
@@ -31,7 +31,7 @@ class HighThroughputPPOTrainer:
 
         self.optimizer.zero_grad(set_to_none=True)
 
-        # PyTorch 2.x API for autocast
+        # PyTorch 2.x Unified AMP autocast API
         device_type = "cuda" if self.use_cuda else "cpu"
         dtype = torch.bfloat16 if (self.use_cuda and torch.cuda.is_bf16_supported()) else torch.float16
 
@@ -43,7 +43,9 @@ class HighThroughputPPOTrainer:
             surr2 = torch.clamp(ratios, 0.88, 1.12) * adv_t
             actor_loss = -torch.min(surr1, surr2).mean()
 
-            critic_loss = nn.functional.huber_loss(values.squeeze(), rtg_t)
+            # Explicitly flatten both value prediction and target tensors to 1D (.view(-1))
+            # to prevent PyTorch scalar vs vector broadcasting size warnings
+            critic_loss = nn.functional.huber_loss(values.view(-1), rtg_t.view(-1))
             entropy_loss = -entropy.mean()
 
             total_loss = actor_loss + 0.5 * critic_loss + self.entropy_coef * entropy_loss
