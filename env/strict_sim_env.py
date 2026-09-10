@@ -5,7 +5,7 @@ import pandas as pd
 class StrictOptionSimEnv:
     """
     Simulated trading environment featuring action dead-zones, market impact,
-    and linear/quadratic transaction costs to stop excessive over-trading.
+    linear/quadratic transaction costs, and step-by-step metric history tracking.
     """
     def __init__(
         self,
@@ -33,6 +33,16 @@ class StrictOptionSimEnv:
         self.current_position = 0.0
         self.equity = 10000.0
 
+        # History Tracking
+        self.history_capital = [self.equity]
+        self.history_pnl = [0.0]
+        self.history_positions = [0.0]
+
+    @property
+    def capital(self) -> float:
+        """Alias property expected by evaluation scripts."""
+        return self.equity
+
     def reset(self, seed: int = None):
         if seed is not None:
             np.random.seed(seed)
@@ -40,6 +50,10 @@ class StrictOptionSimEnv:
         self.current_step = np.random.randint(0, max(1, self.max_steps - 2000))
         self.current_position = 0.0
         self.equity = 10000.0
+
+        self.history_capital = [self.equity]
+        self.history_pnl = [0.0]
+        self.history_positions = [0.0]
 
         return self._get_observation(), {}
 
@@ -75,14 +89,22 @@ class StrictOptionSimEnv:
         self.current_position = target_position
         self.equity *= (1.0 + step_reward)
 
+        # Record History
+        self.history_capital.append(self.equity)
+        self.history_pnl.append(raw_pnl)
+        self.history_positions.append(self.current_position)
+
         terminated = bool(self.current_step >= self.max_steps)
         truncated = bool(self.equity < 5000.0)
 
         info = {
             "pnl": raw_pnl,
+            "step_pnl": raw_pnl,
             "turnover_cost": turnover_cost,
+            "trade_cost": turnover_cost,
             "position": self.current_position,
-            "equity": self.equity
+            "equity": self.equity,
+            "capital": self.equity
         }
 
         return self._get_observation(), float(step_reward * 100.0), terminated, truncated, info

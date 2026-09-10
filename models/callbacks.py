@@ -49,27 +49,32 @@ class EvaluationCallback:
             next_obs, reward, terminated, truncated, info = self.eval_env.step(action_np)
             done = terminated or truncated
 
-            if info.get("trade_cost", 0.0) > 0.0:
+            trade_cost = info.get("trade_cost", info.get("turnover_cost", 0.0))
+            if trade_cost > 0.0:
                 trades_count += 1
-            total_pnl += info.get("step_pnl", 0.0)
 
+            total_pnl += info.get("step_pnl", info.get("pnl", 0.0))
             obs = next_obs
 
-        # Calculate True Equity Curve Returns (Minute-by-Minute)
-        equity_curve = np.array(self.eval_env.history_capital, dtype=np.float64)
-        pct_returns = np.diff(equity_curve) / equity_curve[:-1]
+        # Calculate True Equity Curve Returns (Step-by-Step)
+        equity_curve = np.array(getattr(self.eval_env, "history_capital", [10000.0]), dtype=np.float64)
+
+        if len(equity_curve) > 1:
+            pct_returns = np.diff(equity_curve) / (equity_curve[:-1] + 1e-8)
+        else:
+            pct_returns = np.array([0.0])
 
         std_ret = np.std(pct_returns)
         mean_ret = np.mean(pct_returns)
 
-        # Clamped Sharpe Calculation to avoid division-by-zero or step-level explosions
+        # Clamped Sharpe Calculation
         if std_ret > 1e-5 and trades_count > 0:
             raw_sharpe = (mean_ret / std_ret) * np.sqrt(252 * 375)
             sharpe = float(np.clip(raw_sharpe, -100.0, 100.0))
         else:
             sharpe = 0.0
 
-        final_capital = self.eval_env.capital
+        final_capital = getattr(self.eval_env, "capital", getattr(self.eval_env, "equity", 10000.0))
         win_rate = (np.sum(pct_returns > 0) / len(pct_returns)) * 100.0 if len(pct_returns) > 0 else 0.0
 
         print(
