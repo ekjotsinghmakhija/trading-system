@@ -148,25 +148,28 @@ def run_training_pipeline():
                     optimizer.step()
 
         model.eval()
-        test_losses = []
+        all_z_test = []
+        all_y_test = []
+
         with torch.no_grad():
             for batch_xn, batch_xb, batch_y in test_loader:
                 batch_xn = batch_xn.to(device, non_blocking=True)
                 batch_xb = batch_xb.to(device, non_blocking=True)
-                batch_y = batch_y.to(device, non_blocking=True)
 
                 if device.type == "cuda":
                     with torch.amp.autocast('cuda'):
                         z_n_test, _ = model(batch_xn, batch_xb)
-                        batch_loss = criterion(z_n_test, batch_y).item()
                 else:
                     z_n_test, _ = model(batch_xn, batch_xb)
-                    batch_loss = criterion(z_n_test, batch_y).item()
 
-                test_losses.append(batch_loss)
+                all_z_test.append(z_n_test.cpu())
+                all_y_test.append(batch_y.cpu())
 
-        avg_test_loss = float(np.mean(test_losses))
-        print(f"  └─ Fold {fold} Test Sharpe Loss: {avg_test_loss:.4f}")
+        full_z = torch.cat(all_z_test, dim=0)
+        full_y = torch.cat(all_y_test, dim=0)
+        test_loss = criterion(full_z, full_y).item()
+
+        print(f"  └─ Fold {fold} Test Sharpe Loss: {test_loss:.4f}")
 
         del model, train_loader, test_loader, train_dataset, test_dataset
         if device.type == "cuda":
