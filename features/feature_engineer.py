@@ -1,136 +1,90 @@
-import numpy as np
 import pandas as pd
-import polars as pl
+import numpy as np
 
-def safe_divide(numerator: pd.Series, denominator: pd.Series, fill_value: float = 0.0) -> pd.Series:
-    """Safe division preventing division by zero and NaNs."""
-    return (numerator / denominator.replace(0, np.nan)).fillna(fill_value)
 
-class FeatureEngine:
+def compute_uncorrelated_features(df: pd.DataFrame, apply_orthogonalization: bool = True) -> pd.DataFrame:
     """
-    Generates the complete 18-feature Alpha Matrix across 3 specialized clusters
-    for Indian Index Options & Futures intraday data (1-min frequency).
+    Computes 16 mathematically rigorous, stationary, and orthogonalized technical
+    features covering Return Dynamics, Volatility, Momentum, Volume, and Regimes.
     """
-    def __init__(self, df: pd.DataFrame):
-        self.df = df.copy().sort_values("timestamp").reset_index(drop=True)
+    data = df.copy()
 
-    def calculate_cluster_1_price_momentum(self) -> pd.DataFrame:
-        """Cluster 1: Technical & Trend Momentum (6 Features)"""
-        close = self.df["close"]
-        high = self.df["high"]
-        low = self.df["low"]
-        volume = self.df["volume"]
+    # Ensure OHLCV inputs exist
+    for col in ["close", "high", "low", "volume"]:
+        if col not in data.columns:
+            if col == "high": data["high"] = data["close"] * 1.001
+            elif col == "low": data["low"] = data["close"] * 0.999
+            elif col == "volume": data["volume"] = 100000.0
 
-        # 1. Log Returns (1-step)
-        self.df["feat_log_return_1m"] = np.log(close / close.shift(1)).fillna(0.0)
+    close = data["close"]
+    high = data["high"]
+    low = data["low"]
+    volume = data["volume"]
 
-        # 2. RSI (14-period)
-        delta = close.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = safe_divide(gain, loss)
-        self.df["feat_rsi_14"] = (100 - (100 / (1 + rs))).fillna(50.0) / 100.0  # Normalized [0, 1]
+    feat = pd.DataFrame(index=data.index)
 
-        # 3. Normalized Distance to VWAP
-        cum_vol = volume.cumsum()
-        cum_vol_price = (close * volume).cumsum()
-        vwap = safe_divide(cum_vol_price, cum_vol, fill_value=close.iloc[0])
-        self.df["feat_vwap_dist"] = safe_divide(close - vwap, vwap)
+    # --- 1. Return Dynamics & Log Ratios (Features 1-3) ---
+    log_ret = np.log(close / close.shift(1)).fillna(0.0)
+    feat["f01_log_ret_1"] = log_ret
+    feat["f02_log_ret_5"] = np.log(close / close.shift(5)).fillna(0.0)
+    feat["f03_log_ret_20"] = np.log(close / close.shift(20)).fillna(0.0)
 
-        # 4. Normalized Intraday Range (High-Low / Close)
-        self.df["feat_intraday_range"] = safe_divide(high - low, close)
+    # --- 2. Volatility Regimes (Features 4-6) ---
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr_14 = tr.rolling(14).mean()
 
-        # 5. Realized Volatility (20-bar rolling std of log returns)
-        self.df["feat_realized_vol_20"] = self.df["feat_log_return_1m"].rolling(20).std().fillna(0.0)
+    feat["f04_norm_atr"] = (atr_14 / (close + 1e-8)).fillna(0.0)
+    feat["f05_realized_vol_10"] = log_ret.rolling(10).std().fillna(0.0)
+    feat["f06_parkinson_vol"] = (np.sqrt((1.0 / (4.0 * np.log(2.0))) * (np.log(high / low) ** 2)).rolling(10).mean()).fillna(0.0)
 
-        # 6. Volume Acceleration (5m SMA / 20m SMA)
-        vol_sma_5 = volume.rolling(5).mean()
-        vol_sma_20 = volume.rolling(20).mean()
-        self.df["feat_vol_acceleration"] = safe_divide(vol_sma_5, vol_sma_20, fill_value=1.0)
+    # --- 3. Momentum & Trend Oscillators (Features 7-10) ---
+    delta = close.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    rs = gain / (loss + 1e-8)
+    feat["f07_rsi_scaled"] = ((100.0 - (100.0 / (1.0 + rs))) / 100.0 - 0.5).fillna(0.0)
 
-        return self.df
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    macd = ema12 - ema26
+    feat["f08_macd_norm"] = (macd / (atr_14 + 1e-8)).fillna(0.0)
 
-    def calculate_cluster_2_options_microstructure(self) -> pd.DataFrame:
-        """Cluster 2: Options Microstructure & Positioning (6 Features)"""
-        call_oi = self.df.get("call_open_interest", pd.Series(1.0, index=self.df.index))
-        put_oi = self.df.get("put_open_interest", pd.Series(1.0, index=self.df.index))
-        call_iv = self.df.get("call_iv", pd.Series(0.15, index=self.df.index))
-        put_iv = self.df.get("put_iv", pd.Series(0.15, index=self.df.index))
+    low_14 = low.rolling(14).min()
+    high_14 = high.rolling(14).max()
+    stoch_k = (close - low_14) / (high_14 - low_14 + 1e-8)
+    feat["f09_stoch_k"] = (stoch_k - 0.5).fillna(0.0)
 
-        # 7. PCR (Put-Call Ratio by Open Interest)
-        pcr = safe_divide(put_oi, call_oi, fill_value=1.0)
-        self.df["feat_pcr_oi"] = pcr
+    rolling_std = log_ret.rolling(10).std()
+    feat["f10_vol_adj_mom"] = (log_ret.rolling(10).mean() / (rolling_std + 1e-8)).fillna(0.0)
 
-        # 8. PCR Velocity (5-bar change in PCR)
-        self.df["feat_pcr_velocity"] = pcr.diff(5).fillna(0.0)
+    # --- 4. Mean Reversion & Spread (Features 11-13) ---
+    sma_20 = close.rolling(20).mean()
+    std_20 = close.rolling(20).std()
+    feat["f11_bollinger_pct_b"] = (((close - (sma_20 - 2 * std_20)) / (4 * std_20 + 1e-8)) - 0.5).fillna(0.0)
+    feat["f12_return_zscore"] = ((log_ret - log_ret.rolling(20).mean()) / (ret_std := log_ret.rolling(20).std() + 1e-8)).fillna(0.0)
+    feat["f13_close_to_sma_ratio"] = ((close - sma_20) / (sma_20 + 1e-8)).fillna(0.0)
 
-        # 9. IV Skew (Put IV - Call IV)
-        self.df["feat_iv_skew"] = put_iv - call_iv
+    # --- 5. Volume & Flow Dynamics (Features 14-16) ---
+    vol_sma_20 = volume.rolling(20).mean()
+    feat["f14_volume_ratio"] = ((volume - vol_sma_20) / (vol_sma_20 + 1e-8)).fillna(0.0)
 
-        # 10. IV Skew Velocity (5-bar diff in Skew)
-        self.df["feat_iv_skew_velocity"] = self.df["feat_iv_skew"].diff(5).fillna(0.0)
+    mf_multiplier = ((close - low) - (high - close)) / (high - low + 1e-8)
+    feat["f15_cmf_surrogate"] = (mf_multiplier * volume).rolling(10).mean() / (vol_sma_20 + 1e-8)
+    feat["f16_price_vol_corr"] = log_ret.rolling(10).corr(volume.pct_change().fillna(0.0)).fillna(0.0)
 
-        # 11. ATM Implied Volatility Level
-        self.df["feat_atm_iv"] = (call_iv + put_iv) / 2.0
+    # Standard Normalization (Robust Scaling)
+    feat_cols = list(feat.columns)
+    feat = (feat - feat.mean()) / (feat.std() + 1e-8)
+    feat = feat.clip(-5.0, 5.0).fillna(0.0)
 
-        # 12. Net Open Interest Change Rate (Total OI momentum)
-        total_oi = call_oi + put_oi
-        self.df["feat_oi_change_rate"] = safe_divide(total_oi.diff(5), total_oi.shift(5)).fillna(0.0)
+    # --- QR Gram-Schmidt Orthogonalization ---
+    if apply_orthogonalization and len(feat) > len(feat_cols):
+        X = feat.values
+        Q, _ = np.linalg.qr(X)
+        feat = pd.DataFrame(Q, index=data.index, columns=feat_cols)
 
-        return self.df
-
-    def calculate_cluster_3_greeks_orderflow(self) -> pd.DataFrame:
-        """Cluster 3: Options Greeks & Order Flow Dynamics (6 Features)"""
-        bid_qty = self.df.get("best_bid_qty", self.df["volume"] * 0.5)
-        ask_qty = self.df.get("best_ask_qty", self.df["volume"] * 0.5)
-        delta = self.df.get("net_delta", pd.Series(0.0, index=self.df.index))
-        gamma = self.df.get("net_gamma", pd.Series(0.0, index=self.df.index))
-        vega = self.df.get("net_vega", pd.Series(0.0, index=self.df.index))
-        theta = self.df.get("net_theta", pd.Series(0.0, index=self.df.index))
-
-        # 13. Level-2 Order Flow Imbalance (OFI)
-        total_depth = bid_qty + ask_qty
-        self.df["feat_ofi"] = safe_divide(bid_qty - ask_qty, total_depth).clip(-1.0, 1.0)
-
-        # 14. Net Delta Exposure
-        self.df["feat_net_delta"] = delta
-
-        # 15. Delta Acceleration (5-bar diff in Net Delta)
-        self.df["feat_delta_acceleration"] = delta.diff(5).fillna(0.0)
-
-        # 16. Net Gamma Exposure
-        self.df["feat_net_gamma"] = gamma
-
-        # 17. Net Vega Exposure
-        self.df["feat_net_vega"] = vega
-
-        # 18. Theta Decay Velocity
-        self.df["feat_theta_decay_rate"] = safe_divide(theta, self.df["close"]).fillna(0.0)
-
-        return self.df
-
-    def build_feature_matrix(self) -> pd.DataFrame:
-        """Run full 18-feature generation pipeline."""
-        self.calculate_cluster_1_price_momentum()
-        self.calculate_cluster_2_options_microstructure()
-        self.calculate_cluster_3_greeks_orderflow()
-
-        # Drop warm-up NA rows caused by rolling windows
-        self.df = self.df.dropna().reset_index(drop=True)
-        return self.df
-
-if __name__ == "__main__":
-    dates = pd.date_range("2026-09-01 09:15:00", periods=100, freq="1min", tz="UTC")
-    dummy_df = pd.DataFrame({
-        "timestamp": dates,
-        "open": np.random.randn(100).cumsum() + 25000,
-        "high": np.random.randn(100).cumsum() + 25020,
-        "low": np.random.randn(100).cumsum() + 24980,
-        "close": np.random.randn(100).cumsum() + 25000,
-        "volume": np.random.randint(100, 5000, size=100)
-    })
-
-    engine = FeatureEngine(dummy_df)
-    matrix = engine.build_feature_matrix()
-    feature_cols = [c for c in matrix.columns if c.startswith("feat_")]
-    print(f"[✓] Successfully generated {len(feature_cols)} features across {len(matrix)} rows.")
+    feat["close"] = close
+    return feat
