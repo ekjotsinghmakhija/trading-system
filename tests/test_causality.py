@@ -9,11 +9,14 @@ def test_zero_lookahead_leakage():
     # Compute features on full series
     df_full = engineer.compute_18_alpha_matrix(df_raw.copy())
 
-    # Compute features on truncated series (t = 250)
-    df_truncated = engineer.compute_18_alpha_matrix(df_raw.iloc[:250].copy())
+    # Compute features on truncated series (t = 350)
+    df_truncated = engineer.compute_18_alpha_matrix(df_raw.iloc[:350].copy())
 
-    # Check scaled_rsi at t=248 to verify exact causal equality
-    val_full = df_full.iloc[248]["scaled_rsi"]
-    val_trunc = df_truncated.iloc[248]["scaled_rsi"]
+    # Get the last valid timestamp/index from truncated feature set post-dropna
+    last_idx = df_truncated.index[-1]
+
+    # Compare values at the exact same boundary index
+    val_full = df_full.loc[last_idx, "scaled_rsi"]
+    val_trunc = df_truncated.loc[last_idx, "scaled_rsi"]
 
     assert np.isclose(val_full, val_trunc, atol=1e-7), "Lookahead leakage detected in feature calculation!"
