@@ -1,146 +1,224 @@
+import math
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributions import Normal
 
-class Chomp1d(nn.Module):
-    """Removes trailing padding to preserve strict causal temporal sequence constraints."""
-    def __init__(self, chomp_size: int):
-        super(Chomp1d, self).__init__()
-        self.chomp_size = chomp_size
+logger = logging.getLogger(__name__)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x[:, :, :-self.chomp_size].contiguous()
 
-class TemporalTemporalBlock(nn.Module):
-    """Dilated 1D Causal Convolutional Block with BatchNorm, Dropout, and Residual Connection."""
-    def __init__(self, n_inputs: int, n_outputs: int, kernel_size: int, stride: int, dilation: int, padding: int, dropout: float = 0.15):
-        super(TemporalTemporalBlock, self).__init__()
-        self.conv1 = nn.Conv1d(n_inputs, n_outputs, kernel_size, stride=stride, padding=padding, dilation=dilation)
-        self.chomp1 = Chomp1d(padding)
-        self.bn1 = nn.BatchNorm1d(n_outputs)
-        self.relu1 = nn.ReLU()
-        self.dropout1 = nn.Dropout(dropout)
-
-        self.conv2 = nn.Conv1d(n_outputs, n_outputs, kernel_size, stride=stride, padding=padding, dilation=dilation)
-        self.chomp2 = Chomp1d(padding)
-        self.bn2 = nn.BatchNorm1d(n_outputs)
-        self.relu2 = nn.ReLU()
-        self.dropout2 = nn.Dropout(dropout)
-
-        self.net = nn.Sequential(
-            self.conv1, self.chomp1, self.bn1, self.relu1, self.dropout1,
-            self.conv2, self.chomp2, self.bn2, self.relu2, self.dropout2
+class CausalConv1d(nn.Module):
+    """
+    1D Causal Convolution layer to ensure model predictions at time t
+    depend only on past and present observations (t' <= t), preventing lookahead bias.
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, dilation: int = 1):
+        super().__init__()
+        self.padding = (kernel_size - 1) * dilation
+        self.conv = nn.Conv1d(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=self.padding,
+            dilation=dilation
         )
-        self.downsample = nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
-        self.relu = nn.ReLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.net(x)
+        # Pad left along sequence dimension and slice off extra trailing steps
+        out = self.conv(x)
+        if self.padding != 0:
+            out = out[:, :, :-self.padding]
+        return out
+
+
+class TemporalBlock(nn.Module):
+    """
+    Residual Causal TCN Block for temporal feature extraction in financial time-series.
+    Employs dual Causal Convolutions with residual downsampling connection.
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, dilation: int = 1):
+        super().__init__()
+        self.conv1 = CausalConv1d(in_channels, out_channels, kernel_size, stride=stride, dilation=dilation)
+        self.relu1 = nn.ReLU()
+        self.conv2 = CausalConv1d(out_channels, out_channels, kernel_size, stride=stride, dilation=dilation)
+        self.relu2 = nn.ReLU()
+
+        self.downsample = nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else None
+        self.init_weights()
+
+    def init_weights(self):
+        """Kaiming Normal Initialization optimized for ReLU activations."""
+        nn.init.kaiming_normal_(self.conv1.conv.weight, mode='fan_in', nonlinearity='relu')
+        nn.init.kaiming_normal_(self.conv2.conv.weight, mode='fan_in', nonlinearity='relu')
+        if self.downsample is not None:
+            nn.init.kaiming_normal_(self.downsample.weight, mode='fan_in', nonlinearity='relu')
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.conv1(x)
+        out = self.relu1(out)
+        out = self.conv2(out)
+        out = self.relu2(out)
+
         res = x if self.downsample is None else self.downsample(x)
-        return self.relu(out + res)
+        return F.relu(out + res)
 
-class TemporalConvolutionalNetwork(nn.Module):
-    """3-Layer TCN with exponentially increasing dilations (d = 1, 2, 4)."""
-    def __init__(self, num_inputs: int, num_channels: list = [64, 64, 64], kernel_size: int = 3, dropout: float = 0.15):
-        super(TemporalConvolutionalNetwork, self).__init__()
-        layers = []
-        num_levels = len(num_channels)
-        for i in range(num_levels):
-            dilation_size = 2 ** i
-            in_channels = num_inputs if i == 0 else num_channels[i - 1]
-            out_channels = num_channels[i]
-            padding = (kernel_size - 1) * dilation_size
-            layers.append(
-                TemporalTemporalBlock(
-                    in_channels, out_channels, kernel_size, stride=1,
-                    dilation=dilation_size, padding=padding, dropout=dropout
-                )
-            )
-        self.network = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Input shape expected: (Batch, Features, Sequence_Length)
-        return self.network(x)
 
 class ActorCriticTCNGRU(nn.Module):
     """
-    Combined TCN + GRU Actor-Critic Policy & Value Estimator.
-    Processes (Batch, 60_bars, D_features) tensors with < 4ms execution overhead.
+    Hybrid TCN-GRU Architecture for PPO Intraday Options Strategy.
+
+    Structure:
+      1. TCN Block: Extracts multi-scale local temporal patterns.
+      2. GRU Layer: Captures long-term sequential dependencies.
+      3. Bottleneck Layer: Dense layer with LayerNorm for stable representations.
+      4. Dual Heads:
+         - Actor Head: Continuous action policy mean (tanh bounded [-1, 1]).
+         - Critic Head: State value estimation V(s).
     """
-    def __init__(self, input_dim: int, hidden_gru_dim: int = 128, num_actions: int = 1):
-        super(ActorCriticTCNGRU, self).__init__()
+    def __init__(
+        self,
+        input_dim: int,
+        seq_len: int = 60,
+        tcn_channels: int = 64,
+        gru_hidden: int = 128,
+        action_dim: int = 1
+    ):
+        super().__init__()
         self.input_dim = input_dim
-        self.hidden_gru_dim = hidden_gru_dim
+        self.seq_len = seq_len
+        self.action_dim = action_dim
 
-        # 1. Temporal Feature Extraction (TCN)
-        self.tcn = TemporalConvolutionalNetwork(num_inputs=input_dim, num_channels=[64, 64, 64], kernel_size=3, dropout=0.15)
+        logger.info(
+            f"Initializing ActorCriticTCNGRU | input_dim={input_dim}, seq_len={seq_len}, "
+            f"tcn_channels={tcn_channels}, gru_hidden={gru_hidden}, action_dim={action_dim}"
+        )
 
-        # 2. Sequential Context Tracker (GRU)
-        self.gru = nn.GRU(input_size=64, hidden_size=hidden_gru_dim, num_layers=1, batch_first=True)
+        # 1. TCN Feature Extractor
+        self.tcn = TemporalBlock(
+            in_channels=input_dim,
+            out_channels=tcn_channels,
+            kernel_size=3,
+            stride=1,
+            dilation=1
+        )
 
-        # 3. Actor (Policy) Head
-        self.actor_dense = nn.Linear(hidden_gru_dim, 64)
-        self.actor_out = nn.Linear(64, num_actions)
+        # 2. Sequential Memory GRU Layer
+        self.gru = nn.GRU(
+            input_size=tcn_channels,
+            hidden_size=gru_hidden,
+            num_layers=1,
+            batch_first=True
+        )
 
-        # 4. Critic (Value) Head
-        self.critic_dense = nn.Linear(hidden_gru_dim, 64)
-        self.critic_out = nn.Linear(64, 1)
+        # 3. Dense Bottleneck Representation Layer
+        self.shared_dense = nn.Sequential(
+            nn.Linear(gru_hidden, 64),
+            nn.LayerNorm(64),
+            nn.ReLU()
+        )
 
-    def forward(self, x: torch.Tensor, h_state: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # 4. Policy (Actor) & Value (Critic) Output Heads
+        self.actor_dense = nn.Linear(64, action_dim)
+        self.critic_dense = nn.Linear(64, 1)
+
+        # Trainable log standard deviation for continuous action exploration
+        self.log_std = nn.Parameter(torch.zeros(1, action_dim))
+
+        self._initialize_heads()
+
+    def _initialize_heads(self):
+        """Orthogonal initialization on output heads to prevent policy saturation traps."""
+        logger.debug("Applying Orthogonal Initialization to Policy and Value heads...")
+
+        # Policy output initialized near zero mean with low variance gain (0.01)
+        nn.init.orthogonal_(self.actor_dense.weight, gain=0.01)
+        nn.init.constant_(self.actor_dense.bias, 0.0)
+
+        # Critic value output standard unit variance gain (1.0)
+        nn.init.orthogonal_(self.critic_dense.weight, gain=1.0)
+        nn.init.constant_(self.critic_dense.bias, 0.0)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Forward pass.
-        x input shape: (Batch, Seq_Len=60, Features=D)
-        returns: (action_a_t [-1, 1], state_value_v_t, next_h_state)
+        Forward Pass.
+
+        Args:
+            x: Input tensor of shape [Batch, Seq_Len, Features] or [Seq_Len, Features]
+
+        Returns:
+            action_mean: Tensor of shape [Batch, Action_Dim] mapped to [-1, 1]
+            action_log_std: Expanded log standard deviation tensor [Batch, Action_Dim]
+            state_value: Critic state value estimation V(s) [Batch, 1]
         """
-        batch_size = x.size(0)
+        if x.dim() == 2:
+            x = x.unsqueeze(0)
 
-        # Reshape for 1D Conv TCN: (Batch, Features, Seq_Len)
-        x_tcn_in = x.transpose(1, 2)
-        tcn_out = self.tcn(x_tcn_in)
+        # Reshape to [Batch, Features, Seq_Len] for 1D convolution
+        x_trans = x.transpose(1, 2)
 
-        # Reshape back for GRU: (Batch, Seq_Len, Channels=64)
-        gru_in = tcn_out.transpose(1, 2)
+        # Process through TCN
+        tcn_out = self.tcn(x_trans)
+        tcn_out = tcn_out.transpose(1, 2)  # Back to [Batch, Seq_Len, Channels]
 
-        if h_state is None:
-            h_state = torch.zeros(1, batch_size, self.hidden_gru_dim, device=x.device)
+        # Process through GRU
+        gru_out, _ = self.gru(tcn_out)
+        last_step_features = gru_out[:, -1, :]  # Extract last hidden temporal state
 
-        gru_out, h_next = self.gru(gru_in, h_state)
+        # Shared feature representations
+        shared_rep = self.shared_dense(last_step_features)
 
-        # Take last time step embedding from GRU output
-        last_step_repr = gru_out[:, -1, :]
+        # Actor and Critic head predictions
+        action_mean = torch.tanh(self.actor_dense(shared_rep))
+        state_value = self.critic_dense(shared_rep)
 
-        # Compute Action Output a_t bounded by Tanh
-        actor_h = F.relu(self.actor_dense(last_step_repr))
-        action = torch.tanh(self.actor_out(actor_h))
+        # Match batch dimension for action distribution log_std
+        action_log_std = self.log_std.expand_as(action_mean)
 
-        # Compute Critic State Value Output V(s_t)
-        critic_h = F.relu(self.critic_dense(last_step_repr))
-        state_value = self.critic_out(critic_h)
+        return action_mean, action_log_std, state_value
 
-        return action, state_value, h_next
+    def get_action(self, x: torch.Tensor, deterministic: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Sample an action from Gaussian distribution parameterized by policy network outputs.
 
-if __name__ == "__main__":
-    # Latency & Shape Verification Benchmark
-    import time
+        Args:
+            x: Observation state input tensor
+            deterministic: If True, returns policy mean without exploration noise
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[+] Benchmarking network on device: {device}")
+        Returns:
+            action: Sampled bounded action tensor [-1.0, 1.0]
+            log_prob: Log probability density of sampled action
+            state_value: Critic state value V(s)
+        """
+        action_mean, action_log_std, state_value = self.forward(x)
 
-    batch_size = 32
-    seq_len = 60
-    num_features = 18
+        if deterministic:
+            return action_mean, torch.zeros_like(action_mean), state_value
 
-    # Create dummy observation batch
-    dummy_input = torch.randn(batch_size, seq_len, num_features, device=device)
-    model = ActorCriticTCNGRU(input_dim=num_features).to(device)
-    model.eval()
+        std = torch.exp(action_log_std)
+        dist = Normal(action_mean, std)
 
-    # Measure execution latency
-    start_time = time.perf_counter()
-    with torch.no_grad():
-        actions, values, _ = model(dummy_input)
-    elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+        raw_action = dist.rsample()
+        log_prob = dist.log_prob(raw_action).sum(dim=-1, keepdim=True)
+        bounded_action = torch.clamp(raw_action, -1.0, 1.0)
 
-    print(f"[✓] Forward pass complete in {elapsed_ms:.2f} ms")
-    print(f"    Actions Tensor Shape : {actions.shape} (Range: [{actions.min():.2f}, {actions.max():.2f}])")
-    print(f"    Values Tensor Shape  : {values.shape}")
+        return bounded_action, log_prob, state_value
+
+    def evaluate_actions(self, x: torch.Tensor, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Evaluate batch of actions for PPO policy loss updates.
+
+        Returns:
+            log_prob: Log probability of input actions
+            entropy: Entropy of current policy distribution
+            state_value: Estimated state values V(s)
+        """
+        action_mean, action_log_std, state_value = self.forward(x)
+        std = torch.exp(action_log_std)
+        dist = Normal(action_mean, std)
+
+        log_prob = dist.log_prob(actions).sum(dim=-1, keepdim=True)
+        entropy = dist.entropy().sum(dim=-1, keepdim=True)
+
+        return log_prob, entropy, state_value
