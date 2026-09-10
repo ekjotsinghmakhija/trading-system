@@ -49,27 +49,14 @@ def load_and_preprocess_data(con):
     nifty_df = con.execute("SELECT * FROM nifty_features_1m ORDER BY timestamp").pl()
     banknifty_df = con.execute("SELECT * FROM banknifty_features_1m ORDER BY timestamp").pl()
 
-    # Standardize timestamp datatypes
-    if nifty_df.schema["timestamp"] == pl.Utf8:
-        nifty_df = nifty_df.with_columns(pl.col("timestamp").str.to_datetime(strict=False))
-    else:
-        nifty_df = nifty_df.with_columns(pl.col("timestamp").cast(pl.Datetime))
+    # Standardize timestamp representations
+    nifty_df = nifty_df.with_columns(pl.col("timestamp").cast(pl.Utf8))
+    banknifty_df = banknifty_df.with_columns(pl.col("timestamp").cast(pl.Utf8))
 
-    if banknifty_df.schema["timestamp"] == pl.Utf8:
-        banknifty_df = banknifty_df.with_columns(pl.col("timestamp").str.to_datetime(strict=False))
-    else:
-        banknifty_df = banknifty_df.with_columns(pl.col("timestamp").cast(pl.Datetime))
-
-    # Initial timestamp alignment
-    common_ts = nifty_df.select("timestamp").join(banknifty_df.select("timestamp"), on="timestamp", how="inner").unique()
-    nifty_df = nifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
-    banknifty_df = banknifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
-
-    # Find overlapping non-metadata feature columns
     meta_cols = {"timestamp", "trading_date", "target_5m_return"}
     candidate_cols = sorted(list((set(nifty_df.columns) & set(banknifty_df.columns)) - meta_cols))
 
-    # Exclude columns with high missingness (> 20% nulls)
+    # Filter out columns with excessive null values (>20%)
     feature_cols = []
     for col in candidate_cols:
         nifty_nulls = nifty_df.select(pl.col(col).null_count()).item() / len(nifty_df)
@@ -77,16 +64,15 @@ def load_and_preprocess_data(con):
         if nifty_nulls < 0.20 and bank_nulls < 0.20:
             feature_cols.append(col)
 
-    # Forward-fill and backward-fill indicator warmup periods
-    nifty_df = nifty_df.with_columns([pl.col(c).ffill().bfill() for c in feature_cols])
-    banknifty_df = banknifty_df.with_columns([pl.col(c).ffill().bfill() for c in feature_cols])
+    # Use native Polars expression syntax for forward and backward filling
+    nifty_df = nifty_df.with_columns([pl.col(c).forward_fill().backward_fill() for c in feature_cols])
+    banknifty_df = banknifty_df.with_columns([pl.col(c).forward_fill().backward_fill() for c in feature_cols])
 
-    # Drop remaining nulls in required columns (target_5m_return)
     req_cols = feature_cols + ["target_5m_return"]
     nifty_df = nifty_df.drop_nulls(subset=req_cols)
     banknifty_df = banknifty_df.drop_nulls(subset=req_cols)
 
-    # Final timestamp alignment
+    # Align timestamps across datasets after cleaning
     common_ts = nifty_df.select("timestamp").join(banknifty_df.select("timestamp"), on="timestamp", how="inner").unique()
     nifty_df = nifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
     banknifty_df = banknifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")

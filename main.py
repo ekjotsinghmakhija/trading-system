@@ -26,19 +26,8 @@ def load_and_preprocess_data(con):
     nifty_df = con.execute("SELECT * FROM nifty_features_1m ORDER BY timestamp").pl()
     banknifty_df = con.execute("SELECT * FROM banknifty_features_1m ORDER BY timestamp").pl()
 
-    if nifty_df.schema["timestamp"] == pl.Utf8:
-        nifty_df = nifty_df.with_columns(pl.col("timestamp").str.to_datetime(strict=False))
-    else:
-        nifty_df = nifty_df.with_columns(pl.col("timestamp").cast(pl.Datetime))
-
-    if banknifty_df.schema["timestamp"] == pl.Utf8:
-        banknifty_df = banknifty_df.with_columns(pl.col("timestamp").str.to_datetime(strict=False))
-    else:
-        banknifty_df = banknifty_df.with_columns(pl.col("timestamp").cast(pl.Datetime))
-
-    common_ts = nifty_df.select("timestamp").join(banknifty_df.select("timestamp"), on="timestamp", how="inner").unique()
-    nifty_df = nifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
-    banknifty_df = banknifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
+    nifty_df = nifty_df.with_columns(pl.col("timestamp").cast(pl.Utf8))
+    banknifty_df = banknifty_df.with_columns(pl.col("timestamp").cast(pl.Utf8))
 
     meta_cols = {"timestamp", "trading_date", "target_5m_return"}
     candidate_cols = sorted(list((set(nifty_df.columns) & set(banknifty_df.columns)) - meta_cols))
@@ -50,8 +39,8 @@ def load_and_preprocess_data(con):
         if nifty_nulls < 0.20 and bank_nulls < 0.20:
             feature_cols.append(col)
 
-    nifty_df = nifty_df.with_columns([pl.col(c).ffill().bfill() for c in feature_cols])
-    banknifty_df = banknifty_df.with_columns([pl.col(c).ffill().bfill() for c in feature_cols])
+    nifty_df = nifty_df.with_columns([pl.col(c).forward_fill().backward_fill() for c in feature_cols])
+    banknifty_df = banknifty_df.with_columns([pl.col(c).forward_fill().backward_fill() for c in feature_cols])
 
     req_cols = feature_cols + ["target_5m_return"]
     nifty_df = nifty_df.drop_nulls(subset=req_cols)
