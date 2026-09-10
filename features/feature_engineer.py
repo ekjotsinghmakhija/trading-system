@@ -3,6 +3,8 @@ import pandas as pd
 
 
 class FeatureEngineer:
+    """Computes high-frequency institutional alpha features based on financial machine learning research."""
+
     def compute_18_alpha_matrix(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
         features = pd.DataFrame(index=df.index)
@@ -12,73 +14,56 @@ class FeatureEngineer:
         low = df["low"]
         open_p = df["open"]
         volume = df["volume"]
+        eps = 1e-8
 
-        fut_close = df["futures_close"] if "futures_close" in df.columns else close
-        oi = df["oi"] if "oi" in df.columns else pd.Series(0.0, index=df.index)
+        # 1. Multi-Horizon Stationary Log Returns (1m, 3m, 5m, 15m, 30m)
+        log_c = np.log(np.maximum(close, eps))
+        features["log_return"] = log_c.diff(1).fillna(0.0)  # Preserved for target reward computation
+        features["log_ret_3m"] = log_c.diff(3).fillna(0.0)
+        features["log_ret_5m"] = log_c.diff(5).fillna(0.0)
+        features["log_ret_15m"] = log_c.diff(15).fillna(0.0)
+        features["log_ret_30m"] = log_c.diff(30).fillna(0.0)
 
-        # 1. Basis Alpha
-        features["b_fut"] = (fut_close - close) / (close + 1e-8)
+        # 2. Garman-Klass Microstructural Volatility (5m & 20m)
+        log_hl = np.log(np.maximum(high, eps) / np.maximum(low, eps)) ** 2
+        log_co = np.log(np.maximum(close, eps) / np.maximum(open_p, eps)) ** 2
+        gk_vol = np.sqrt(np.maximum(0.5 * log_hl - (2.0 * np.log(2.0) - 1.0) * log_co, eps))
+        features["gk_vol_5m"] = gk_vol.rolling(5).mean().fillna(0.0)
+        features["gk_vol_20m"] = gk_vol.rolling(20).mean().fillna(0.0)
 
-        # 2. RSI Scaled
-        delta = close.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        rs = gain / (loss + 1e-8)
-        features["scaled_rsi"] = (100 - (100 / (1 + rs))) / 100.0
+        # 3. Parkinson Range Volatility (10m)
+        parkinson = np.sqrt((1.0 / (4.0 * np.log(2.0))) * log_hl)
+        features["parkinson_vol_10m"] = parkinson.rolling(10).mean().fillna(0.0)
 
-        # 3. Log Returns
-        features["log_return"] = np.log(np.maximum(close, 1e-8) / np.maximum(close.shift(1), 1e-8))
+        # 4. Order Flow / Volume Force Proxy (Directional Trade Pressure)
+        body_ratio = (close - open_p) / (high - low + eps)
+        vol_force_1m = body_ratio * np.log1p(volume)
+        features["vol_force_1m"] = vol_force_1m
+        features["vol_force_5m"] = vol_force_1m.rolling(5).mean().fillna(0.0)
 
-        # 4. Volatility Z-Score
-        vol_20 = features["log_return"].rolling(20).std().fillna(0.0)
-        vol_std = vol_20.rolling(100).std().fillna(1e-8)
-        features["volatility_zscore"] = (vol_20 - vol_20.rolling(100).mean().fillna(0.0)) / (vol_std + 1e-8)
+        # 5. Amihud Price Impact / Illiquidity Measure
+        abs_ret = np.abs(features["log_return"])
+        features["amihud_illiquidity"] = (abs_ret / (np.log1p(volume) + eps)).rolling(10).mean().fillna(0.0)
 
-        # 5. Volume Z-Score
-        vol_m = volume.rolling(20).mean().fillna(0.0)
-        vol_s = volume.rolling(20).std().fillna(1e-8)
-        features["volume_zscore"] = (volume - vol_m) / (vol_s + 1e-8)
+        # 6. Multi-Timeframe Volume-Weighted Price (VWAP) Distances
+        pv = close * volume
+        vwap_5m = pv.rolling(5).sum() / (volume.rolling(5).sum() + eps)
+        vwap_20m = pv.rolling(20).sum() / (volume.rolling(20).sum() + eps)
+        features["vwap_dist_5m"] = (close - vwap_5m) / (vwap_5m + eps)
+        features["vwap_dist_20m"] = (close - vwap_20m) / (vwap_20m + eps)
 
-        # 6. Spreads
-        features["hl_spread"] = (high - low) / (close + 1e-8)
-        features["oc_spread"] = (close - open_p) / (open_p + 1e-8)
+        # 7. Volatility-Adjusted Momentum (Rolling Sharpe Proxy)
+        std_15m = features["log_return"].rolling(15).std().fillna(eps) + eps
+        features["vol_adj_mom_15m"] = features["log_ret_15m"] / std_15m
 
-        # 7. VWAP Distance
-        cum_vol = volume.cumsum()
-        vwap = (close * volume).cumsum() / (cum_vol + 1e-8)
-        features["vwap_dist"] = (close - vwap) / (vwap + 1e-8)
-
-        # 8. Momentum
-        features["mom_5"] = close.pct_change(5).fillna(0.0)
-        features["mom_20"] = close.pct_change(20).fillna(0.0)
-
-        # 9. OI Change
-        features["oi_change"] = oi.pct_change().fillna(0.0)
-
-        # 10. Shadow Ratios
-        features["upper_shadow"] = (high - np.maximum(close, open_p)) / (high - low + 1e-8)
-        features["lower_shadow"] = (np.minimum(close, open_p) - low) / (high - low + 1e-8)
-
-        # 11. Moving Averages & Volatility
-        ema_12 = close.ewm(span=12, adjust=False).mean()
-        ema_26 = close.ewm(span=26, adjust=False).mean()
-        features["ema_spread"] = (ema_12 - ema_26) / (close + 1e-8)
-        features["realized_vol_10"] = features["log_return"].rolling(10).std().fillna(0.0)
-        features["vpt"] = (volume * close.pct_change().fillna(0.0)).fillna(0.0)
-
-        # 12. Bollinger Band Width
-        sma_20 = close.rolling(20).mean().fillna(0.0)
-        std_20 = close.rolling(20).std().fillna(1e-8)
-        features["bb_width"] = (2 * std_20) / (sma_20 + 1e-8)
-
-        # 13. Normalized Range
-        min_20 = low.rolling(20).min().fillna(0.0)
-        max_20 = high.rolling(20).max().fillna(1e-8)
-        features["norm_range"] = (close - min_20) / (max_20 - min_20 + 1e-8)
+        # 8. Normalized Candlestick Geometry
+        features["hl_spread_norm"] = (high - low) / (close + eps)
+        features["upper_wick_norm"] = (high - np.maximum(close, open_p)) / (high - low + eps)
+        features["lower_wick_norm"] = (np.minimum(close, open_p) - low) / (high - low + eps)
 
         features["timestamp"] = df.get("timestamp", df.index)
         features["symbol"] = df.get("symbol", "NIFTY")
 
-        # Replace any residual inf/-inf with NaN and drop them cleanly
-        features = features.replace([np.inf, -np.inf], np.nan)
+        # Replace residual infinite/NaN values cleanly
+        features = features.replace([np.inf, -np.inf], np.nan).fillna(0.0)
         return features

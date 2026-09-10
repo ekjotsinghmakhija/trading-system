@@ -15,3 +15,6 @@ models/checkpoints/*
 tensorboard_logs/
 *.log
 logs/
+access_token.txt
+data/duckdb/*.duckdb
+data/parquet/*.parquet
