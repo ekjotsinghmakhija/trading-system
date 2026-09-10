@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Tuple
 
 class Chomp1d(nn.Module):
     def __init__(self, chomp_size: int):
@@ -42,7 +43,6 @@ class CrossAssetAttention(nn.Module):
         self.scale = feature_dim ** -0.5
 
     def forward(self, nifty_feat: torch.Tensor, banknifty_feat: torch.Tensor) -> torch.Tensor:
-        # Cross-attention between NIFTY and BANK NIFTY representation spaces
         q = self.query(nifty_feat)
         k = self.key(banknifty_feat)
         v = self.value(banknifty_feat)
@@ -72,7 +72,6 @@ class DualAlphaTCN(nn.Module):
         self.tcn = nn.Sequential(*layers)
         self.cross_attn = CrossAssetAttention(num_channels[-1])
 
-        # Asset Specific Signal Prediction Heads
         self.nifty_head = nn.Sequential(
             nn.Linear(num_channels[-1] * 2, 32),
             nn.ReLU(),
@@ -88,11 +87,9 @@ class DualAlphaTCN(nn.Module):
         )
 
     def forward(self, x_nifty: torch.Tensor, x_banknifty: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Inputs expected as [Batch, Features, Sequence_Length]
-        h_nifty = self.tcn(x_nifty)[:, :, -1]          # Extract last timestep sequence vector
+        h_nifty = self.tcn(x_nifty)[:, :, -1]
         h_banknifty = self.tcn(x_banknifty)[:, :, -1]
 
-        # Cross-Asset Context Fusion
         fused_nifty = self.cross_attn(h_nifty, h_banknifty)
         fused_banknifty = self.cross_attn(h_banknifty, h_nifty)
 
