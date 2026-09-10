@@ -1,64 +1,57 @@
 import numpy as np
 import polars as pl
 from sklearn.neighbors import NearestNeighbors
-from typing import Tuple, Dict
+from typing import Dict, Tuple, List
 
 class FactorLedger:
-    """
-    High-dimensional state memory ledger.
-    Tracks feature states S_t against forward return outcomes R_{t+5}
-    and computes hazard regime entry suppression masks.
-    """
-    def __init__(self, hazard_threshold: float = -0.0015, target_threshold: float = 0.0020, k_neighbors: int = 25):
+    def __init__(
+        self,
+        hazard_threshold: float = -0.0015,
+        target_threshold: float = 0.0020,
+        k_neighbors: int = 25
+    ):
         self.hazard_threshold = hazard_threshold
         self.target_threshold = target_threshold
         self.k_neighbors = k_neighbors
-        self.nn_model = NearestNeighbors(n_neighbors=k_neighbors, metric="euclidean")
-        self.state_matrix: np.ndarray = np.array([])
-        self.outcomes: np.ndarray = np.array([])
-        self.is_fitted: bool = False
+        self.nn_model = None
+        self.state_matrix = None
+        self.is_hazard_state = None
 
-    def build_ledger(self, df: pl.DataFrame, feature_cols: list) -> Dict[str, int]:
-        """
-        Extracts feature vectors and forward path labels from feature DataFrame.
-        """
-        clean_df = df.drop_nulls(subset=feature_cols + ["target_5m_return"])
-        self.state_matrix = clean_df.select(feature_cols).to_numpy()
-        self.outcomes = clean_df.select("target_5m_return").to_numpy().flatten()
+    def build_ledger(self, df: pl.DataFrame, feature_cols: List[str]) -> Dict[str, int]:
+        # Filter for hazard states
+        hazard_df = df.filter(pl.col("target_5m_return") <= self.hazard_threshold)
 
-        # Labels: +1 (Target), -1 (Hazard), 0 (Neutral)
-        labels = np.zeros_like(self.outcomes)
-        labels[self.outcomes >= self.target_threshold] = 1
-        labels[self.outcomes <= self.hazard_threshold] = -1
+        # Fall back to 5th percentile if threshold yields no rows
+        if len(hazard_df) == 0:
+            q_val = df.select(pl.col("target_5m_return").quantile(0.05)).item()
+            hazard_df = df.filter(pl.col("target_5m_return") <= q_val)
 
+        if len(hazard_df) == 0:
+            hazard_df = df
+
+        self.state_matrix = hazard_df.select(feature_cols).to_numpy().astype(np.float32)
+        self.is_hazard_state = np.ones(len(self.state_matrix), dtype=bool)
+
+        # Parallelize KNN fit across all CPU threads
+        n_neighbors = min(self.k_neighbors, len(self.state_matrix))
+        self.nn_model = NearestNeighbors(n_neighbors=n_neighbors, algorithm='auto', n_jobs=-1)
         self.nn_model.fit(self.state_matrix)
-        self.is_fitted = True
 
         return {
-            "total_states": len(self.outcomes),
-            "target_states": int(np.sum(labels == 1)),
-            "hazard_states": int(np.sum(labels == -1)),
-            "neutral_states": int(np.sum(labels == 0))
+            "total_states": len(df),
+            "indexed_hazard_states": len(self.state_matrix),
+            "k_neighbors": n_neighbors
         }
 
-    def evaluate_hazard_probability(self, query_state: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Evaluates query state vector(s) against historical ledger.
-        Returns (hazard_probability, entry_suppression_mask).
-        """
-        if not self.is_fitted:
-            raise RuntimeError("FactorLedger must be built before evaluating hazard states.")
+    def evaluate_hazard_probability(self, current_state: np.ndarray) -> Tuple[float, np.ndarray]:
+        if self.nn_model is None or self.state_matrix is None or len(self.state_matrix) == 0:
+            return 0.0, np.array([False])
 
-        if query_state.ndim == 1:
-            query_state = query_state.reshape(1, -1)
+        state_input = current_state.reshape(1, -1).astype(np.float32)
+        distances, indices = self.nn_model.kneighbors(state_input)
 
-        distances, indices = self.nn_model.kneighbors(query_state)
+        hazard_neighbors = self.is_hazard_state[indices[0]]
+        hazard_prob = float(np.mean(hazard_neighbors))
+        is_suppressed = hazard_prob >= 0.6
 
-        # Compute local hazard ratio among k-nearest neighbors
-        neighbor_outcomes = self.outcomes[indices]
-        hazard_counts = np.sum(neighbor_outcomes <= self.hazard_threshold, axis=1)
-        hazard_probs = hazard_counts / self.k_neighbors
-
-        # Suppress entries if > 35% of nearest historical states resulted in hazard outcomes
-        suppression_mask = hazard_probs > 0.35
-        return hazard_probs, suppression_mask
+        return hazard_prob, np.array([is_suppressed])

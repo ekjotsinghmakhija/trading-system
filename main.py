@@ -2,7 +2,6 @@ import os
 import sys
 from pathlib import Path
 
-# Add project root to sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -19,42 +18,61 @@ from env.strict_sim_env import StrictSimEnv
 
 DB_PATH = "data/duckdb/market_data.duckdb"
 
+if torch.cuda.is_available():
+    torch.set_float32_matmul_precision('high')
+    torch.backends.cudnn.benchmark = True
+
 def run_end_to_end_system():
-    print("[1/5] Connecting to DuckDB & Loading Feature Space...")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    num_cpus = os.cpu_count() or 4
+    torch.set_num_threads(num_cpus)
+    print(f"[1/5] Hardware Init | Device: {device} | CPU Threads: {num_cpus}")
+
+    print("[2/5] Connecting to DuckDB & Loading Feature Space...")
     con = duckdb.connect(DB_PATH)
-    nifty_df = con.execute("SELECT * FROM nifty_features_1m ORDER BY timestamp").pl().drop_nulls()
-    banknifty_df = con.execute("SELECT * FROM banknifty_features_1m ORDER BY timestamp").pl().drop_nulls()
+    nifty_df = con.execute("SELECT * FROM nifty_features_1m ORDER BY timestamp").pl()
+    banknifty_df = con.execute("SELECT * FROM banknifty_features_1m ORDER BY timestamp").pl()
     con.close()
 
-    # Align on common timestamps using inner join
+    nifty_df = nifty_df.with_columns(pl.col("timestamp").cast(pl.Utf8))
+    banknifty_df = banknifty_df.with_columns(pl.col("timestamp").cast(pl.Utf8))
+
     common_ts = nifty_df.select("timestamp").join(banknifty_df.select("timestamp"), on="timestamp", how="inner").unique()
     nifty_df = nifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
     banknifty_df = banknifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
 
     feature_cols = [c for c in nifty_df.columns if c not in ["timestamp", "trading_date", "target_5m_return"]]
 
-    print("[2/5] Initializing Factor Ledger & Hazard Memory...")
+    required_cols = feature_cols + ["target_5m_return"]
+    nifty_df = nifty_df.drop_nulls(subset=required_cols)
+    banknifty_df = banknifty_df.drop_nulls(subset=required_cols)
+
+    common_ts = nifty_df.select("timestamp").join(banknifty_df.select("timestamp"), on="timestamp", how="inner").unique()
+    nifty_df = nifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
+    banknifty_df = banknifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
+
+    print(f"      └─ Dataset Loaded: {len(nifty_df)} time steps.")
+
+    print("[3/5] Initializing Factor Ledger & Hazard Memory...")
     ledger = FactorLedger(hazard_threshold=-0.0015, target_threshold=0.0020, k_neighbors=25)
     ledger_stats = ledger.build_ledger(nifty_df, feature_cols)
     print(f"      └─ Ledger Ready: {ledger_stats['total_states']} historical states logged.")
 
-    print("[3/5] Loading DualAlphaTCN Model Weights...")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("[4/5] Loading DualAlphaTCN Model Weights...")
     model = DualAlphaTCN(in_channels=len(feature_cols)).to(device)
     model.eval()
 
-    print("[4/5] Initializing Risk Manager & Strict Simulator...")
+    print("[5/5] Initializing Risk Manager & Strict Simulator...")
     risk_mgr = RiskManager(max_drawdown_limit=0.30, kelly_fraction=0.5)
     sim = StrictSimEnv(initial_capital=1000000.0, slippage_ticks=0.5)
 
-    print("[5/5] Running High-Fidelity Historical Replay...")
     timestamps = nifty_df.select("timestamp").to_series().to_list()
     nifty_prices = nifty_df.select("close").to_series().to_numpy()
     banknifty_prices = banknifty_df.select("close").to_series().to_numpy()
 
     seq_len = 15
-    nifty_feats = nifty_df.select(feature_cols).to_numpy()
-    banknifty_feats = banknifty_df.select(feature_cols).to_numpy()
+    nifty_feats = nifty_df.select(feature_cols).to_numpy().astype(np.float32)
+    banknifty_feats = banknifty_df.select(feature_cols).to_numpy().astype(np.float32)
 
     daily_logs = []
 
@@ -76,7 +94,12 @@ def run_end_to_end_system():
             x_banknifty = torch.tensor(banknifty_feats[idx-seq_len:idx].T, dtype=torch.float32).unsqueeze(0).to(device)
 
             with torch.no_grad():
-                z_nifty, z_banknifty = model(x_nifty, x_banknifty)
+                if device.type == "cuda":
+                    with torch.amp.autocast('cuda'):
+                        z_nifty, z_banknifty = model(x_nifty, x_banknifty)
+                else:
+                    z_nifty, z_banknifty = model(x_nifty, x_banknifty)
+
                 exp_returns = np.array([z_nifty.item(), z_banknifty.item()])
 
             hist_nifty_rets = np.diff(nifty_prices[max(0, idx-60):idx+1]) / nifty_prices[max(0, idx-60):idx]
