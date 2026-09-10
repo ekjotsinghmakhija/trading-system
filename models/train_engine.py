@@ -17,13 +17,11 @@ logger = logging.getLogger(__name__)
 
 def generate_rich_indicator_dataset(n_steps: int = 50000) -> pd.DataFrame:
     """
-    Generates a rich dataset containing price trends, volatility, momentum,
-    and technical indicators (RSI, MACD, Bollinger Bands, EMAs, ATR, Stoch).
+    Generates a synthetic feature dataset containing technical indicators.
     """
     np.random.seed(42)
     t = np.linspace(0, 500, n_steps)
 
-    # Synthetic Base Price
     price = 100.0 + np.sin(t) * 15.0 + np.cumsum(np.random.randn(n_steps) * 0.2)
     df = pd.DataFrame({"close": price})
 
@@ -31,7 +29,6 @@ def generate_rich_indicator_dataset(n_steps: int = 50000) -> pd.DataFrame:
     df["low"] = df["close"] - np.abs(np.random.randn(n_steps) * 0.5)
     df["open"] = df["close"].shift(1).fillna(df["close"].iloc[0])
 
-    # Indicators
     df["ema_9"] = df["close"].ewm(span=9, adjust=False).mean()
     df["ema_21"] = df["close"].ewm(span=21, adjust=False).mean()
     df["ema_50"] = df["close"].ewm(span=50, adjust=False).mean()
@@ -110,20 +107,20 @@ def train_ppo_engine(
     feature_cols = [col for col in df.columns if col not in ["datetime", "date", "timestamp"]]
     print(f"[✓] Environment loaded with {len(feature_cols)} feature indicators: {feature_cols}\n")
 
-    train_env = StrictOptionSimEnv(df=df, feature_cols=feature_cols)
-    eval_env = StrictOptionSimEnv(df=df, feature_cols=feature_cols)
+    train_env = StrictOptionSimEnv(df=df, feature_cols=feature_cols, initial_capital=50000.0)
+    eval_env = StrictOptionSimEnv(df=df, feature_cols=feature_cols, initial_capital=50000.0)
 
     input_dim = len(feature_cols)
     model = ActorCriticTCNGRU(input_dim=input_dim).to(device)
 
-    initial_lr = 3e-5
-    min_lr = 1e-6
+    initial_lr = 3e-4
+    min_lr = 1e-5
     optimizer = optim.AdamW(model.parameters(), lr=initial_lr, weight_decay=1e-4, eps=1e-5)
 
     gamma = 0.99
     gae_lambda = 0.95
     clip_eps = 0.2
-    entropy_coef = 0.01
+    entropy_coef = 0.02
     value_coef = 0.5
     batch_size = 2048
     n_epochs = 10

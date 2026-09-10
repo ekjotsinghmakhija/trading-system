@@ -13,8 +13,9 @@ class StrictOptionSimEnv:
         feature_cols: list = None,
         fee_rate: float = 0.0003,       # 0.03% base fee
         impact_coef: float = 0.0001,    # Quadratic market impact
-        dead_zone: float = 0.15,        # Minimum conviction barrier
-        holding_penalty: float = 0.0001 # Holding friction
+        dead_zone: float = 0.05,        # Lowered to encourage early trade execution
+        holding_penalty: float = 0.00005, # Mild friction
+        initial_capital: float = 50000.0  # Set starting portfolio capital to ₹50,000
     ):
         self.df = df.reset_index(drop=True)
 
@@ -27,11 +28,12 @@ class StrictOptionSimEnv:
         self.impact_coef = impact_coef
         self.dead_zone = dead_zone
         self.holding_penalty = holding_penalty
+        self.initial_capital = initial_capital
 
         self.current_step = 0
         self.max_steps = len(self.df) - 1
         self.current_position = 0.0
-        self.equity = 10000.0
+        self.equity = self.initial_capital
 
         # History Tracking
         self.history_capital = [self.equity]
@@ -46,9 +48,9 @@ class StrictOptionSimEnv:
         if seed is not None:
             np.random.seed(seed)
 
-        self.current_step = np.random.randint(0, max(1, self.max_steps - 2000))
+        self.current_step = np.random.randint(0, max(1, self.max_steps - 5000))
         self.current_position = 0.0
-        self.equity = 10000.0
+        self.equity = self.initial_capital
 
         self.history_capital = [self.equity]
         self.history_pnl = [0.0]
@@ -57,7 +59,8 @@ class StrictOptionSimEnv:
         return self._get_observation(), {}
 
     def _get_observation(self):
-        row = self.df.iloc[self.current_step]
+        safe_step = min(self.current_step, self.max_steps)
+        row = self.df.iloc[safe_step]
         obs = row[self.feature_cols].values.astype(np.float32)
         return np.append(obs, np.float32(self.current_position))
 
@@ -108,7 +111,7 @@ class StrictOptionSimEnv:
         self.history_positions.append(self.current_position)
 
         terminated = bool(self.current_step >= self.max_steps)
-        truncated = bool(self.equity < 5000.0)
+        truncated = bool(self.equity < (self.initial_capital * 0.5))
 
         info = {
             "pnl": raw_pnl,

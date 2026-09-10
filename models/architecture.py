@@ -1,97 +1,126 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.distributions import Normal
+import numpy as np
+import pandas as pd
 
 
-class ChokuTemporalBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3, dilation: int = 1):
-        super().__init__()
-        padding = (kernel_size - 1) * dilation
-        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, padding=padding, dilation=dilation)
-        self.relu = nn.ReLU()
-        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size, padding=padding, dilation=dilation)
-        self.downsample = nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else None
+class StrictOptionSimEnv:
+    """
+    Simulated trading environment featuring action dead-zones, market impact,
+    linear/quadratic transaction costs, and step-by-step metric history tracking.
+    """
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        feature_cols: list = None,
+        fee_rate: float = 0.0003,       # 0.03% base fee
+        impact_coef: float = 0.0001,    # Quadratic market impact
+        dead_zone: float = 0.05,        # Lowered to encourage early trade execution
+        holding_penalty: float = 0.00005, # Mild friction
+        initial_capital: float = 50000.0  # Set starting portfolio capital to ₹50,000
+    ):
+        self.df = df.reset_index(drop=True)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        res = x if self.downsample is None else self.downsample(x)
-        out = self.relu(self.conv1(x))
-        out = self.conv2(out)
+        if feature_cols is None:
+            self.feature_cols = [c for c in self.df.columns if c != "close"]
+        else:
+            self.feature_cols = feature_cols
 
-        if out.shape[-1] != res.shape[-1]:
-            out = out[..., :res.shape[-1]]
+        self.fee_rate = fee_rate
+        self.impact_coef = impact_coef
+        self.dead_zone = dead_zone
+        self.holding_penalty = holding_penalty
+        self.initial_capital = initial_capital
 
-        return self.relu(out + res)
+        self.current_step = 0
+        self.max_steps = len(self.df) - 1
+        self.current_position = 0.0
+        self.equity = self.initial_capital
 
+        # History Tracking
+        self.history_capital = [self.equity]
+        self.history_pnl = [0.0]
+        self.history_positions = [0.0]
 
-class ActorCriticTCNGRU(nn.Module):
-    def __init__(self, input_dim: int = None, action_dim: int = 1):
-        super().__init__()
-        self.action_dim = action_dim
+    @property
+    def capital(self) -> float:
+        return self.equity
 
-        # Temporal Sequence Extractor
-        self.tcn = ChokuTemporalBlock(in_channels=1, out_channels=32, kernel_size=3, dilation=1)
-        self.gru = nn.GRU(input_size=32, hidden_size=64, batch_first=True)
+    def reset(self, seed: int = None):
+        if seed is not None:
+            np.random.seed(seed)
 
-        # Dynamic Dense Layer - Automatically infers input vector length (handles N features + 1 position)
-        self.fc_features = nn.Sequential(
-            nn.LazyLinear(64),
-            nn.LayerNorm(64),
-            nn.ReLU(),
-            nn.Linear(64, 64),
-            nn.LayerNorm(64),
-            nn.ReLU()
-        )
+        self.current_step = np.random.randint(0, max(1, self.max_steps - 5000))
+        self.current_position = 0.0
+        self.equity = self.initial_capital
 
-        # Actor & Critic Heads
-        self.actor_dense = nn.Linear(64 + 64, 64)
-        self.actor_mean = nn.Linear(64, action_dim)
-        # Low noise sampling initialization (std ~ 0.082)
-        self.log_std = nn.Parameter(torch.ones(action_dim) * -2.5)
+        self.history_capital = [self.equity]
+        self.history_pnl = [0.0]
+        self.history_positions = [0.0]
 
-        self.critic_dense = nn.Linear(64 + 64, 64)
-        self.critic_value = nn.Linear(64, 1)
+        return self._get_observation(), {}
 
-    def forward(self, x: torch.Tensor):
-        if x.dim() == 1:
-            x = x.unsqueeze(0)
+    def _get_observation(self):
+        safe_step = min(self.current_step, self.max_steps)
+        row = self.df.iloc[safe_step]
+        obs = row[self.feature_cols].values.astype(np.float32)
+        return np.append(obs, np.float32(self.current_position))
 
-        # Sequence Path
-        x_trans = x.unsqueeze(1)
-        tcn_out = self.tcn(x_trans)
-        tcn_permuted = tcn_out.permute(0, 2, 1)
+    def step(self, raw_action: np.ndarray):
+        # Index Guard
+        if self.current_step >= self.max_steps:
+            obs = self._get_observation()
+            info = {
+                "pnl": 0.0,
+                "step_pnl": 0.0,
+                "turnover_cost": 0.0,
+                "trade_cost": 0.0,
+                "position": self.current_position,
+                "equity": self.equity,
+                "capital": self.equity
+            }
+            return obs, 0.0, True, False, info
 
-        gru_out, _ = self.gru(tcn_permuted)
-        gru_feat = gru_out[:, -1, :]
+        action_val = float(raw_action[0]) if isinstance(raw_action, (np.ndarray, list)) else float(raw_action)
 
-        # Dense Path (Dynamic Input Shape Adaptor)
-        dense_feat = self.fc_features(x)
-        combined = torch.cat([gru_feat, dense_feat], dim=-1)
+        # Dead Zone Action Mapping
+        if abs(action_val) < self.dead_zone:
+            target_position = 0.0
+        else:
+            sign = np.sign(action_val)
+            scaled = (abs(action_val) - self.dead_zone) / (1.0 - self.dead_zone)
+            target_position = float(sign * np.clip(scaled, 0.0, 1.0))
 
-        # Actor and Value Heads
-        act_hidden = F.relu(self.actor_dense(combined))
-        action_mean = torch.tanh(self.actor_mean(act_hidden))
+        # Returns and Friction
+        current_price = self.df.iloc[self.current_step]["close"]
+        self.current_step += 1
+        next_price = self.df.iloc[min(self.current_step, self.max_steps)]["close"]
 
-        crit_hidden = F.relu(self.critic_dense(combined))
-        state_value = self.critic_value(crit_hidden)
+        price_return = (next_price - current_price) / (current_price + 1e-8)
+        raw_pnl = self.current_position * price_return
 
-        return action_mean, state_value
+        pos_delta = abs(target_position - self.current_position)
+        turnover_cost = (pos_delta * self.fee_rate) + (self.impact_coef * (pos_delta ** 2))
+        holding_cost = abs(target_position) * self.holding_penalty
 
-    def get_action(self, x: torch.Tensor, deterministic: bool = False):
-        action_mean, value = self.forward(x)
-        std = torch.exp(self.log_std)
-        dist = Normal(action_mean, std)
+        step_reward = raw_pnl - turnover_cost - holding_cost
+        self.current_position = target_position
+        self.equity *= (1.0 + step_reward)
 
-        action = action_mean if deterministic else dist.sample()
-        log_prob = dist.log_prob(action).sum(dim=-1)
-        return action, log_prob, value
+        # Record History
+        self.history_capital.append(self.equity)
+        self.history_pnl.append(raw_pnl)
+        self.history_positions.append(self.current_position)
 
-    def evaluate_actions(self, x: torch.Tensor, actions: torch.Tensor):
-        action_mean, values = self.forward(x)
-        std = torch.exp(self.log_std)
-        dist = Normal(action_mean, std)
+        terminated = bool(self.current_step >= self.max_steps)
+        truncated = bool(self.equity < (self.initial_capital * 0.5))
 
-        log_prob = dist.log_prob(actions).sum(dim=-1)
-        entropy = dist.entropy().sum(dim=-1)
+        info = {
+            "pnl": raw_pnl,
+            "step_pnl": raw_pnl,
+            "turnover_cost": turnover_cost,
+            "trade_cost": turnover_cost,
+            "position": self.current_position,
+            "equity": self.equity,
+            "capital": self.equity
+        }
 
-        return log_prob, entropy, values.view(-1)
+        return self._get_observation(), float(step_reward * 100.0), terminated, truncated, info

@@ -9,15 +9,14 @@ logger = logging.getLogger(__name__)
 
 class EvaluationCallback:
     """
-    Robust Evaluation Callback.
-    Calculates realistic equity returns and prevents Sharpe ratio standard-deviation explosions.
+    Robust Evaluation Callback with isolated environment resets.
     """
     def __init__(
         self,
         eval_env,
         model,
         device: torch.device,
-        eval_interval: int = 100_000,
+        eval_interval: int = 20_000,
         checkpoint_dir: str = "models/checkpoints",
         writer: SummaryWriter = None
     ):
@@ -56,8 +55,8 @@ class EvaluationCallback:
             total_pnl += info.get("step_pnl", info.get("pnl", 0.0))
             obs = next_obs
 
-        # Calculate True Equity Curve Returns (Step-by-Step)
-        equity_curve = np.array(getattr(self.eval_env, "history_capital", [10000.0]), dtype=np.float64)
+        # Calculate Returns
+        equity_curve = np.array(getattr(self.eval_env, "history_capital", [50000.0]), dtype=np.float64)
 
         if len(equity_curve) > 1:
             pct_returns = np.diff(equity_curve) / (equity_curve[:-1] + 1e-8)
@@ -74,7 +73,7 @@ class EvaluationCallback:
         else:
             sharpe = 0.0
 
-        final_capital = getattr(self.eval_env, "capital", getattr(self.eval_env, "equity", 10000.0))
+        final_capital = getattr(self.eval_env, "capital", getattr(self.eval_env, "equity", 50000.0))
         win_rate = (np.sum(pct_returns > 0) / len(pct_returns)) * 100.0 if len(pct_returns) > 0 else 0.0
 
         print(
@@ -88,14 +87,13 @@ class EvaluationCallback:
             self.writer.add_scalar("eval/capital", final_capital, global_step)
             self.writer.add_scalar("eval/win_rate", win_rate, global_step)
 
-        # Auto-Rescue: Inject noise if model locks into 0 trades for 2 consecutive evals
+        # Auto-Rescue: Inject noise if model lock stays at 0 trades
         if trades_count == 0:
             self.stagnant_eval_count += 1
             if self.stagnant_eval_count >= 2:
-                print(f"[⚠️ STAGNATION DETECTED] Policy executed 0 trades across multiple windows.")
-                print("[🚀 Auto-Rescue] Perturbing actor weights to break deadlock...")
+                print(f"[⚠️ STAGNATION DETECTED] Policy executed 0 trades. Perturbing weights...")
                 with torch.no_grad():
-                    self.model.actor_dense.weight.add_(torch.randn_like(self.model.actor_dense.weight) * 0.05)
+                    self.model.actor_dense.weight.add_(torch.randn_like(self.model.actor_dense.weight) * 0.1)
                 self.stagnant_eval_count = 0
         else:
             self.stagnant_eval_count = 0
