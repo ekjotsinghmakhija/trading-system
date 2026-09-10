@@ -26,3 +26,4 @@ tensorboard>=2.14.0
 
 # (Optional) Hyperparameter Optimization
 optuna>=3.4.0
+psutil
