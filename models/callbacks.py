@@ -98,6 +98,6 @@ class EvaluationCallback:
             print(f"[✓] New Best Sharpe ({sharpe:.2f}) Saved -> {best_model_path}")
 
         step_checkpoint_path = os.path.join(self.checkpoint_dir, f"model_step_{global_step}.pt")
-            torch.save(self.model.state_dict(), step_checkpoint_path)
+        torch.save(self.model.state_dict(), step_checkpoint_path)
 
         return sharpe
