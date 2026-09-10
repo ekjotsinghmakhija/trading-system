@@ -1,57 +1,53 @@
 import numpy as np
-import pandas as pd
+import polars as pl
+from itertools import combinations
+from typing import List, Tuple, Generator
 
-
-class CPCVEvaluator:
+class CombinatorialPurgedCV:
     """
-    Combinatorial Purged Cross-Validation Engine.
-    Enforces Purging and Embargoing between train/test splits to eliminate leakage.
+    Combinatorial Purged Cross-Validation (CPCV) for time series backtesting.
+    Enforces time-based purging and embargoing between train and test splits
+    to prevent lookahead bias and autocorrelation leakage.
     """
-    def __init__(self, n_splits: int = 5, purge_window: int = 60, embargo_window: int = 120):
+    def __init__(self, n_splits: int = 5, n_test_splits: int = 2, purge_window: int = 5, embargo_pct: float = 0.01):
         self.n_splits = n_splits
-        self.purge_window = purge_window
-        self.embargo_window = embargo_window
+        self.n_test_splits = n_test_splits
+        self.purge_window = purge_window  # Number of steps forward (e.g., target horizon = 5m)
+        self.embargo_pct = embargo_pct
 
-    def generate_purged_folds(self, total_samples: int):
-        fold_size = total_samples // self.n_splits
-        indices = np.arange(total_samples)
+    def split(self, df: pl.DataFrame) -> Generator[Tuple[np.ndarray, np.ndarray], None, None]:
+        n_samples = len(df)
+        indices = np.arange(n_samples)
 
-        for i in range(self.n_splits):
-            test_start = i * fold_size
-            test_end = (i + 1) * fold_size if i < self.n_splits - 1 else total_samples
+        # Partition data into contiguous temporal blocks
+        block_bounds = np.linspace(0, n_samples, self.n_splits + 1, dtype=int)
+        blocks = [indices[block_bounds[i]:block_bounds[i+1]] for i in range(self.n_splits)]
 
-            test_idx = indices[test_start:test_end]
+        embargo_offset = int(n_samples * self.embargo_pct)
 
-            # Apply Purging & Embargoing
-            train_mask = np.ones(total_samples, dtype=bool)
+        # Generate combinations of test blocks
+        test_block_combos = list(combinations(range(self.n_splits), self.n_test_splits))
 
-            # Purge before and after test set
-            purge_start = max(0, test_start - self.purge_window)
-            purge_end = min(total_samples, test_end + self.purge_window + self.embargo_window)
+        for test_combo in test_block_combos:
+            test_indices_list = [blocks[i] for i in test_combo]
+            test_indices = np.concatenate(test_indices_list)
 
-            train_mask[purge_start:purge_end] = False
-            train_idx = indices[train_mask]
+            # Start with all remaining indices as train set candidate
+            train_mask = np.ones(n_samples, dtype=bool)
+            train_mask[test_indices] = False
 
-            yield train_idx, test_idx
+            # Apply Purging and Embargoing around each test block
+            for b_idx in test_combo:
+                block_start = blocks[b_idx][0]
+                block_end = blocks[b_idx][-1]
 
-    def compute_deflated_sharpe_ratio(self, returns: np.ndarray, num_trials: int = 10) -> float:
-        """
-        Calculates Deflated Sharpe Ratio (DSR) adjusting for backtest trial count.
-        """
-        if len(returns) < 2 or np.std(returns) == 0:
-            return 0.0
+                # Purge: remove training samples immediately preceding test block whose evaluation overlaps
+                purge_start = max(0, block_start - self.purge_window)
+                train_mask[purge_start:block_start] = False
 
-        sr_calc = np.mean(returns) / np.std(returns) * np.sqrt(375 * 252)
-        skew = pd.Series(returns).skew()
-        kurt = pd.Series(returns).kurtosis()
+                # Embargo: remove training samples immediately following test block to break serial correlation
+                embargo_end = min(n_samples, block_end + 1 + embargo_offset)
+                train_mask[block_end + 1:embargo_end] = False
 
-        # Expected maximum Sharpe under null hypothesis
-        e_max_sr = (1 - 0.57721566) * np.quantile(np.random.normal(0, 1, 10000), 1 - 1/num_trials) + \
-                   0.57721566 * np.quantile(np.random.normal(0, 1, 10000), 1 - 1/(num_trials * np.e))
-
-        denom = np.sqrt(1 - skew * sr_calc + ((kurt - 1) / 4) * (sr_calc ** 2))
-        if denom == 0 or np.isnan(denom):
-            return 0.0
-
-        dsr = (sr_calc - e_max_sr) * np.sqrt(len(returns) - 1) / denom
-        return float(dsr)
+            train_indices = indices[train_mask]
+            yield train_indices, test_indices
