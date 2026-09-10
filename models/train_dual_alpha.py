@@ -49,14 +49,12 @@ def load_and_preprocess_data(con):
     nifty_df = con.execute("SELECT * FROM nifty_features_1m ORDER BY timestamp").pl()
     banknifty_df = con.execute("SELECT * FROM banknifty_features_1m ORDER BY timestamp").pl()
 
-    # Standardize timestamp representations
     nifty_df = nifty_df.with_columns(pl.col("timestamp").cast(pl.Utf8))
     banknifty_df = banknifty_df.with_columns(pl.col("timestamp").cast(pl.Utf8))
 
     meta_cols = {"timestamp", "trading_date", "target_5m_return"}
     candidate_cols = sorted(list((set(nifty_df.columns) & set(banknifty_df.columns)) - meta_cols))
 
-    # Filter out columns with excessive null values (>20%)
     feature_cols = []
     for col in candidate_cols:
         nifty_nulls = nifty_df.select(pl.col(col).null_count()).item() / len(nifty_df)
@@ -64,7 +62,6 @@ def load_and_preprocess_data(con):
         if nifty_nulls < 0.20 and bank_nulls < 0.20:
             feature_cols.append(col)
 
-    # Use native Polars expression syntax for forward and backward filling
     nifty_df = nifty_df.with_columns([pl.col(c).forward_fill().backward_fill() for c in feature_cols])
     banknifty_df = banknifty_df.with_columns([pl.col(c).forward_fill().backward_fill() for c in feature_cols])
 
@@ -72,7 +69,6 @@ def load_and_preprocess_data(con):
     nifty_df = nifty_df.drop_nulls(subset=req_cols)
     banknifty_df = banknifty_df.drop_nulls(subset=req_cols)
 
-    # Align timestamps across datasets after cleaning
     common_ts = nifty_df.select("timestamp").join(banknifty_df.select("timestamp"), on="timestamp", how="inner").unique()
     nifty_df = nifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
     banknifty_df = banknifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
@@ -116,6 +112,15 @@ def run_training_pipeline():
             num_workers=min(4, num_cpus)
         )
 
+        test_dataset = TensorDataset(X_nifty[test_idx], X_banknifty[test_idx], Y_target[test_idx])
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=2048,
+            shuffle=False,
+            pin_memory=(device.type == "cuda"),
+            num_workers=min(4, num_cpus)
+        )
+
         model = DualAlphaTCN(in_channels=len(feature_cols)).to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
         criterion = DifferentialSharpeLoss()
@@ -143,20 +148,30 @@ def run_training_pipeline():
                     optimizer.step()
 
         model.eval()
+        test_losses = []
         with torch.no_grad():
-            X_n_te = X_nifty[test_idx].to(device)
-            X_bn_te = X_banknifty[test_idx].to(device)
-            Y_te = Y_target[test_idx].to(device)
+            for batch_xn, batch_xb, batch_y in test_loader:
+                batch_xn = batch_xn.to(device, non_blocking=True)
+                batch_xb = batch_xb.to(device, non_blocking=True)
+                batch_y = batch_y.to(device, non_blocking=True)
 
-            if device.type == "cuda":
-                with torch.amp.autocast('cuda'):
-                    z_n_test, _ = model(X_n_te, X_bn_te)
-                    test_loss = criterion(z_n_test, Y_te).item()
-            else:
-                z_n_test, _ = model(X_n_te, X_bn_te)
-                test_loss = criterion(z_n_test, Y_te).item()
+                if device.type == "cuda":
+                    with torch.amp.autocast('cuda'):
+                        z_n_test, _ = model(batch_xn, batch_xb)
+                        batch_loss = criterion(z_n_test, batch_y).item()
+                else:
+                    z_n_test, _ = model(batch_xn, batch_xb)
+                    batch_loss = criterion(z_n_test, batch_y).item()
 
-            print(f"  └─ Fold {fold} Test Sharpe Loss: {test_loss:.4f}")
+                test_losses.append(batch_loss)
+
+        avg_test_loss = float(np.mean(test_losses))
+        print(f"  └─ Fold {fold} Test Sharpe Loss: {avg_test_loss:.4f}")
+
+        del model, train_loader, test_loader, train_dataset, test_dataset
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        gc.collect()
 
         fold += 1
 
