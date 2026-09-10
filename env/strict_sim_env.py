@@ -40,7 +40,6 @@ class StrictOptionSimEnv:
 
     @property
     def capital(self) -> float:
-        """Alias property expected by evaluation scripts."""
         return self.equity
 
     def reset(self, seed: int = None):
@@ -63,6 +62,20 @@ class StrictOptionSimEnv:
         return np.append(obs, np.float32(self.current_position))
 
     def step(self, raw_action: np.ndarray):
+        # Index Guard
+        if self.current_step >= self.max_steps:
+            obs = self._get_observation()
+            info = {
+                "pnl": 0.0,
+                "step_pnl": 0.0,
+                "turnover_cost": 0.0,
+                "trade_cost": 0.0,
+                "position": self.current_position,
+                "equity": self.equity,
+                "capital": self.equity
+            }
+            return obs, 0.0, True, False, info
+
         action_val = float(raw_action[0]) if isinstance(raw_action, (np.ndarray, list)) else float(raw_action)
 
         # Dead Zone Action Mapping
@@ -76,7 +89,7 @@ class StrictOptionSimEnv:
         # Returns and Friction
         current_price = self.df.iloc[self.current_step]["close"]
         self.current_step += 1
-        next_price = self.df.iloc[self.current_step]["close"]
+        next_price = self.df.iloc[min(self.current_step, self.max_steps)]["close"]
 
         price_return = (next_price - current_price) / (current_price + 1e-8)
         raw_pnl = self.current_position * price_return

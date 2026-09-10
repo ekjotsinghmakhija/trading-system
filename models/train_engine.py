@@ -15,67 +15,59 @@ from models.callbacks import EvaluationCallback
 logger = logging.getLogger(__name__)
 
 
-def generate_rich_indicator_dataset(n_steps: int = 20000) -> pd.DataFrame:
+def generate_rich_indicator_dataset(n_steps: int = 50000) -> pd.DataFrame:
     """
     Generates a rich dataset containing price trends, volatility, momentum,
     and technical indicators (RSI, MACD, Bollinger Bands, EMAs, ATR, Stoch).
     """
     np.random.seed(42)
-    t = np.linspace(0, 200, n_steps)
+    t = np.linspace(0, 500, n_steps)
 
-    # Synthetic Base Price (Sinusoidal Trend + Random Walk)
+    # Synthetic Base Price
     price = 100.0 + np.sin(t) * 15.0 + np.cumsum(np.random.randn(n_steps) * 0.2)
     df = pd.DataFrame({"close": price})
 
-    # High / Low / Open estimation for ATR and Oscillators
     df["high"] = df["close"] + np.abs(np.random.randn(n_steps) * 0.5)
     df["low"] = df["close"] - np.abs(np.random.randn(n_steps) * 0.5)
     df["open"] = df["close"].shift(1).fillna(df["close"].iloc[0])
 
-    # 1. Exponential Moving Averages (EMA)
+    # Indicators
     df["ema_9"] = df["close"].ewm(span=9, adjust=False).mean()
     df["ema_21"] = df["close"].ewm(span=21, adjust=False).mean()
     df["ema_50"] = df["close"].ewm(span=50, adjust=False).mean()
 
-    # 2. Moving Average Convergence Divergence (MACD)
     ema_12 = df["close"].ewm(span=12, adjust=False).mean()
     ema_26 = df["close"].ewm(span=26, adjust=False).mean()
     df["macd_line"] = ema_12 - ema_26
     df["macd_signal"] = df["macd_line"].ewm(span=9, adjust=False).mean()
     df["macd_hist"] = df["macd_line"] - df["macd_signal"]
 
-    # 3. Relative Strength Index (RSI - 14)
     delta = df["close"].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / (loss + 1e-8)
     df["rsi_14"] = 100 - (100 / (1 + rs))
 
-    # 4. Bollinger Bands (20, 2)
     rolling_mean_20 = df["close"].rolling(window=20).mean()
     rolling_std_20 = df["close"].rolling(window=20).std()
     df["bb_upper"] = rolling_mean_20 + (rolling_std_20 * 2)
     df["bb_lower"] = rolling_mean_20 - (rolling_std_20 * 2)
     df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / (rolling_mean_20 + 1e-8)
 
-    # 5. Stochastic Oscillator (%K, %D)
     low_14 = df["low"].rolling(window=14).min()
     high_14 = df["high"].rolling(window=14).max()
     df["stoch_k"] = 100 * ((df["close"] - low_14) / (high_14 - low_14 + 1e-8))
     df["stoch_d"] = df["stoch_k"].rolling(window=3).mean()
 
-    # 6. Average True Range (ATR - 14)
     tr1 = df["high"] - df["low"]
     tr2 = (df["high"] - df["close"].shift(1)).abs()
     tr3 = (df["low"] - df["close"].shift(1)).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     df["atr_14"] = tr.rolling(window=14).mean()
 
-    # 7. Momentum & Rate of Change (ROC)
     df["momentum_10"] = df["close"] - df["close"].shift(10)
     df["roc_10"] = ((df["close"] - df["close"].shift(10)) / (df["close"].shift(10) + 1e-8)) * 100
 
-    # Fill structural NaNs from rolling indicators
     df.bfill(inplace=True)
     df.fillna(0.0, inplace=True)
 
@@ -84,7 +76,7 @@ def generate_rich_indicator_dataset(n_steps: int = 20000) -> pd.DataFrame:
 
 def train_ppo_engine(
     total_timesteps: int = 12_000_000,
-    eval_interval: int = 20_000,  # LOG & EVAL EVERY 20k STEPS
+    eval_interval: int = 20_000,
     exp_name: str = "ppo_12m"
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -112,13 +104,14 @@ def train_ppo_engine(
     if os.path.exists(processed_data_path):
         df = pd.read_parquet(processed_data_path)
     else:
-        print("[!] No feature parquet found. Generating extended synthetic feature dataset (20k rows with 15+ indicators)...")
-        df = generate_rich_indicator_dataset(n_steps=20000)
+        print("[!] Generating extended synthetic feature dataset (50k rows with 15+ indicators)...")
+        df = generate_rich_indicator_dataset(n_steps=50000)
 
     feature_cols = [col for col in df.columns if col not in ["datetime", "date", "timestamp"]]
     print(f"[✓] Environment loaded with {len(feature_cols)} feature indicators: {feature_cols}\n")
 
-    env = StrictOptionSimEnv(df=df, feature_cols=feature_cols)
+    train_env = StrictOptionSimEnv(df=df, feature_cols=feature_cols)
+    eval_env = StrictOptionSimEnv(df=df, feature_cols=feature_cols)
 
     input_dim = len(feature_cols)
     model = ActorCriticTCNGRU(input_dim=input_dim).to(device)
@@ -137,7 +130,7 @@ def train_ppo_engine(
     rollout_steps = 4096
 
     eval_callback = EvaluationCallback(
-        eval_env=env,
+        eval_env=eval_env,
         model=model,
         device=device,
         eval_interval=eval_interval,
@@ -145,7 +138,7 @@ def train_ppo_engine(
         writer=writer
     )
 
-    obs, _ = env.reset()
+    obs, _ = train_env.reset()
     global_step = 0
 
     while global_step < total_timesteps:
@@ -164,7 +157,7 @@ def train_ppo_engine(
                 action, log_prob, value = model.get_action(obs_tensor, deterministic=False)
 
             action_np = action.cpu().numpy()[0]
-            next_obs, raw_reward, terminated, truncated, _ = env.step(action_np)
+            next_obs, raw_reward, terminated, truncated, _ = train_env.step(action_np)
             done = terminated or truncated
 
             scaled_reward = float(np.clip(raw_reward / 100.0, -5.0, 5.0))
@@ -178,13 +171,11 @@ def train_ppo_engine(
 
             obs = next_obs
             if done:
-                obs, _ = env.reset()
+                obs, _ = train_env.reset()
 
-            # Logging evaluation precisely every 20k steps
             if global_step % eval_interval == 0:
                 eval_callback.run_evaluation(global_step)
 
-        # GAE Advantage Calculation
         with torch.no_grad():
             last_obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
             _, _, last_val = model.get_action(last_obs_tensor)
