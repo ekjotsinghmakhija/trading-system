@@ -20,10 +20,6 @@ def train_ppo_engine(
     eval_interval: int = 100_000,
     exp_name: str = "ppo_12m"
 ):
-    """
-    Stabilized High-Throughput PPO Training Engine.
-    Scales rewards cleanly and bounds policy variance.
-    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     timestamp = int(time.time())
     run_id = f"{exp_name}_{timestamp}"
@@ -62,7 +58,6 @@ def train_ppo_engine(
     input_dim = len(feature_cols)
     model = ActorCriticTCNGRU(input_dim=input_dim).to(device)
 
-    # Learning rate schedule
     initial_lr = 3e-5
     min_lr = 1e-6
     optimizer = optim.AdamW(model.parameters(), lr=initial_lr, weight_decay=1e-4, eps=1e-5)
@@ -107,14 +102,13 @@ def train_ppo_engine(
             next_obs, raw_reward, terminated, truncated, _ = env.step(action_np)
             done = terminated or truncated
 
-            # Reward Scaling: Normalizes raw monetary values down to reasonable RL scales [-5.0, 5.0]
             scaled_reward = float(np.clip(raw_reward / 100.0, -5.0, 5.0))
 
             obs_buf.append(obs)
             act_buf.append(action_np)
             logp_buf.append(log_prob.cpu().numpy()[0])
             rew_buf.append(scaled_reward)
-            val_buf.append(value.cpu().numpy()[0][0])
+            val_buf.append(value.detach().cpu().numpy().reshape(-1)[0])
             done_buf.append(done)
 
             obs = next_obs
@@ -124,11 +118,11 @@ def train_ppo_engine(
             if global_step % eval_interval == 0:
                 eval_callback.run_evaluation(global_step)
 
-        # Generalized Advantage Estimation (GAE)
+        # GAE Advantage Calculation
         with torch.no_grad():
             last_obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
             _, _, last_val = model.get_action(last_obs_tensor)
-            last_val = last_val.cpu().numpy()[0][0]
+            last_val = last_val.detach().cpu().numpy().reshape(-1)[0]
 
         advantages = np.zeros(rollout_steps, dtype=np.float32)
         returns = np.zeros(rollout_steps, dtype=np.float32)
@@ -148,10 +142,8 @@ def train_ppo_engine(
         b_adv = torch.as_tensor(advantages, dtype=torch.float32, device=device)
         b_ret = torch.as_tensor(returns, dtype=torch.float32, device=device)
 
-        # Advantage Normalization
         b_adv = (b_adv - b_adv.mean()) / (b_adv.std() + 1e-8)
 
-        # Optimization Pass
         model.train()
         dataset_size = rollout_steps
         indices = np.arange(dataset_size)
@@ -175,7 +167,8 @@ def train_ppo_engine(
                 surr2 = torch.clamp(ratios, 1.0 - clip_eps, 1.0 + clip_eps) * mb_adv
                 actor_loss = -torch.min(surr1, surr2).mean()
 
-                critic_loss = F.mse_loss(new_val.squeeze(-1), mb_ret)
+                # GUARANTEED SHAPE MATCHING (Flattens both to 1D tensors of shape [2048])
+                critic_loss = F.mse_loss(new_val.view(-1), mb_ret.view(-1))
                 entropy_loss = -entropy.mean()
 
                 total_loss = actor_loss + value_coef * critic_loss + entropy_coef * entropy_loss
