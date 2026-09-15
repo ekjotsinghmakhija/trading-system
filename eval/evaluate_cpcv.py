@@ -1,53 +1,83 @@
+# eval/evaluate_cpcv.py
+
 import numpy as np
-import polars as pl
-from itertools import combinations
+import pandas as pd
+from scipy.stats import norm, skew, kurtosis
 from typing import List, Tuple, Generator
 
-class CombinatorialPurgedCV:
+
+class CombinatorialPurgedKFold:
     """
-    Combinatorial Purged Cross-Validation (CPCV) for time series backtesting.
-    Enforces time-based purging and embargoing between train and test splits
-    to prevent lookahead bias and autocorrelation leakage.
+    Combinatorial Purged Cross-Validation (CPCV) with Embargoing.
+    Prevents leakage caused by overlapping triple-barrier target horizons.
     """
-    def __init__(self, n_splits: int = 5, n_test_splits: int = 2, purge_window: int = 5, embargo_pct: float = 0.01):
+    def __init__(self, n_splits: int = 5, n_test_splits: int = 2, pct_embargo: float = 0.01):
         self.n_splits = n_splits
         self.n_test_splits = n_test_splits
-        self.purge_window = purge_window  # Number of steps forward (e.g., target horizon = 5m)
-        self.embargo_pct = embargo_pct
+        self.pct_embargo = pct_embargo
 
-    def split(self, df: pl.DataFrame) -> Generator[Tuple[np.ndarray, np.ndarray], None, None]:
+    def split(
+        self,
+        df: pd.DataFrame,
+        holding_periods: pd.Series
+    ) -> Generator[Tuple[np.ndarray, np.ndarray], None, None]:
         n_samples = len(df)
         indices = np.arange(n_samples)
+        embargo_offset = int(n_samples * self.pct_embargo)
 
-        # Partition data into contiguous temporal blocks
-        block_bounds = np.linspace(0, n_samples, self.n_splits + 1, dtype=int)
-        blocks = [indices[block_bounds[i]:block_bounds[i+1]] for i in range(self.n_splits)]
+        # Generate chunk bounds
+        chunk_bounds = np.linspace(0, n_samples, self.n_splits + 1, dtype=int)
+        chunks = [(chunk_bounds[i], chunk_bounds[i + 1]) for i in range(self.n_splits)]
 
-        embargo_offset = int(n_samples * self.embargo_pct)
+        from itertools import combinations
+        test_combinations = list(combinations(range(self.n_splits), self.n_test_splits))
 
-        # Generate combinations of test blocks
-        test_block_combos = list(combinations(range(self.n_splits), self.n_test_splits))
+        for test_chunk_ids in test_combinations:
+            test_indices = []
+            purge_mask = np.zeros(n_samples, dtype=bool)
 
-        for test_combo in test_block_combos:
-            test_indices_list = [blocks[i] for i in test_combo]
-            test_indices = np.concatenate(test_indices_list)
+            for cid in test_chunk_ids:
+                start, end = chunks[cid]
+                test_indices.extend(indices[start:end])
 
-            # Start with all remaining indices as train set candidate
-            train_mask = np.ones(n_samples, dtype=bool)
-            train_mask[test_indices] = False
+                # Purge train samples prior to test start whose labels overlap into test set
+                for t in range(max(0, start - 50), start):
+                    if t + holding_periods.iloc[t] >= start:
+                        purge_mask[t] = True
 
-            # Apply Purging and Embargoing around each test block
-            for b_idx in test_combo:
-                block_start = blocks[b_idx][0]
-                block_end = blocks[b_idx][-1]
+                # Apply post-test embargo window
+                embargo_end = min(n_samples, end + embargo_offset)
+                purge_mask[end:embargo_end] = True
 
-                # Purge: remove training samples immediately preceding test block whose evaluation overlaps
-                purge_start = max(0, block_start - self.purge_window)
-                train_mask[purge_start:block_start] = False
+            test_idx = np.array(test_indices)
+            purge_mask[test_idx] = True
+            train_idx = indices[~purge_mask]
 
-                # Embargo: remove training samples immediately following test block to break serial correlation
-                embargo_end = min(n_samples, block_end + 1 + embargo_offset)
-                train_mask[block_end + 1:embargo_end] = False
+            yield train_idx, test_idx
 
-            train_indices = indices[train_mask]
-            yield train_indices, test_indices
+
+def compute_deflated_sharpe_ratio(
+    returns: pd.Series,
+    n_trials: int = 10,
+    benchmark_sr: float = 0.0
+) -> float:
+    """
+    Computes Deflated Sharpe Ratio (DSR) to control for multiple testing over-optimism.
+    """
+    returns = returns.dropna()
+    if len(returns) < 2 or returns.std() == 0:
+        return 0.0
+
+    n = len(returns)
+    sr_hat = (returns.mean() / returns.std()) * np.sqrt(252 * 375)
+
+    sk = skew(returns)
+    kt = kurtosis(returns, fisher=True)
+
+    # Estimate expected maximum Sharpe ratio under null hypothesis
+    e_max_sr = benchmark_sr + (1 - 0.5772156649) * norm.ppf(1 - 1.0 / n_trials) + 0.5772156649 * norm.ppf(1 - 1.0 / (n_trials * np.e))
+
+    sr_variance = (1 + (0.5 * sr_hat**2) - (sk * sr_hat) + ((kt / 4.0) * sr_hat**2)) / (n - 1)
+    dsr_statistic = (sr_hat - e_max_sr) / np.sqrt(max(sr_variance, 1e-8))
+
+    return float(norm.cdf(dsr_statistic))
