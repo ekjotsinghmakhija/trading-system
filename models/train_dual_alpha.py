@@ -12,7 +12,6 @@ if str(PROJECT_ROOT) not in sys.path:
 import duckdb
 import torch
 import numpy as np
-import pandas as pd
 import polars as pl
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -143,7 +142,7 @@ def run_training_pipeline():
         criterion = DifferentialSharpeLoss()
 
         model.train()
-        for epoch in range(5):
+        for epoch in range(10):
             for batch_xn, batch_xb, batch_y in train_loader:
                 batch_xn = batch_xn.to(device, non_blocking=True)
                 batch_xb = batch_xb.to(device, non_blocking=True)

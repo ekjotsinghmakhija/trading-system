@@ -6,29 +6,25 @@ import torch.nn as nn
 
 class DifferentialSharpeLoss(nn.Module):
     """
-    Numerically Stable Differentiable Sharpe Loss.
+    Numerically Stable Differentiable Sharpe Loss with Signal and Target Standardization.
+    Prevents zero-gradient saturation and vanishing loss scaling across micro-batches.
     """
-    def __init__(self, drawdown_penalty_weight: float = 0.0, max_allowed_drawdown: float = 0.15, eps: float = 1e-4):
+    def __init__(self, eps: float = 1e-6):
         super(DifferentialSharpeLoss, self).__init__()
-        self.penalty_weight = drawdown_penalty_weight
-        self.max_dd = max_allowed_drawdown
         self.eps = eps
 
     def forward(self, signals: torch.Tensor, target_returns: torch.Tensor) -> torch.Tensor:
-        portfolio_returns = signals.view(-1) * target_returns.view(-1)
+        signals = signals.view(-1)
+        target_returns = target_returns.view(-1)
 
-        mean_return = torch.mean(portfolio_returns)
-        var_return = torch.var(portfolio_returns, unbiased=False)
-        std_return = torch.sqrt(var_return + self.eps)
+        # Standardize target returns per batch to scale loss gradients
+        target_std = torch.std(target_returns) + self.eps
+        scaled_targets = target_returns / target_std
 
-        sharpe_ratio = mean_return / std_return
+        portfolio_returns = signals * scaled_targets
 
-        if self.penalty_weight > 0.0:
-            cum_returns = torch.cumsum(portfolio_returns, dim=0)
-            running_max = torch.cummax(cum_returns, dim=0)[0]
-            drawdowns = running_max - cum_returns
-            max_drawdown = torch.max(drawdowns)
-            drawdown_penalty = torch.square(torch.clamp(max_drawdown - self.max_dd, min=0.0))
-            return -sharpe_ratio + (self.penalty_weight * drawdown_penalty)
+        mean_ret = torch.mean(portfolio_returns)
+        std_ret = torch.std(portfolio_returns) + self.eps
 
+        sharpe_ratio = mean_ret / std_ret
         return -sharpe_ratio
