@@ -3,7 +3,7 @@
 import numpy as np
 import pandas as pd
 from scipy.stats import norm, skew, kurtosis
-from typing import List, Tuple, Generator
+from typing import List, Tuple, Generator, Union
 
 
 class CombinatorialPurgedKFold:
@@ -18,14 +18,15 @@ class CombinatorialPurgedKFold:
 
     def split(
         self,
-        df: pd.DataFrame,
-        holding_periods: pd.Series
+        df: Union[pd.DataFrame, np.ndarray],
+        holding_periods: Union[pd.Series, np.ndarray, List[int]]
     ) -> Generator[Tuple[np.ndarray, np.ndarray], None, None]:
         n_samples = len(df)
         indices = np.arange(n_samples)
         embargo_offset = int(n_samples * self.pct_embargo)
 
-        # Generate chunk bounds
+        hp_array = holding_periods.values if hasattr(holding_periods, 'values') else np.asarray(holding_periods)
+
         chunk_bounds = np.linspace(0, n_samples, self.n_splits + 1, dtype=int)
         chunks = [(chunk_bounds[i], chunk_bounds[i + 1]) for i in range(self.n_splits)]
 
@@ -40,12 +41,10 @@ class CombinatorialPurgedKFold:
                 start, end = chunks[cid]
                 test_indices.extend(indices[start:end])
 
-                # Purge train samples prior to test start whose labels overlap into test set
                 for t in range(max(0, start - 50), start):
-                    if t + holding_periods.iloc[t] >= start:
+                    if t + hp_array[t] >= start:
                         purge_mask[t] = True
 
-                # Apply post-test embargo window
                 embargo_end = min(n_samples, end + embargo_offset)
                 purge_mask[end:embargo_end] = True
 
@@ -74,7 +73,6 @@ def compute_deflated_sharpe_ratio(
     sk = skew(returns)
     kt = kurtosis(returns, fisher=True)
 
-    # Estimate expected maximum Sharpe ratio under null hypothesis
     e_max_sr = benchmark_sr + (1 - 0.5772156649) * norm.ppf(1 - 1.0 / n_trials) + 0.5772156649 * norm.ppf(1 - 1.0 / (n_trials * np.e))
 
     sr_variance = (1 + (0.5 * sr_hat**2) - (sk * sr_hat) + ((kt / 4.0) * sr_hat**2)) / (n - 1)

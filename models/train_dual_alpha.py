@@ -1,3 +1,5 @@
+# models/train_dual_alpha.py
+
 import os
 import sys
 import gc
@@ -10,17 +12,16 @@ if str(PROJECT_ROOT) not in sys.path:
 import duckdb
 import torch
 import numpy as np
+import pandas as pd
 import polars as pl
 from torch.utils.data import DataLoader, TensorDataset
 
 from models.architecture import DualAlphaTCN
 from models.train_engine import DifferentialSharpeLoss
-from eval.evaluate_cpcv import CombinatorialPurgedCV
+from eval.evaluate_cpcv import CombinatorialPurgedKFold
 from features.factor_ledger import FactorLedger
 
 DB_PATH = "data/duckdb/market_data.duckdb"
-MODEL_SAVE_DIR = Path("checkpoints")
-MODEL_SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
 if torch.cuda.is_available():
     torch.set_float32_matmul_precision('high')
@@ -33,31 +34,38 @@ def setup_hardware():
     torch.set_num_threads(num_cpus)
     print(f"[Hardware Setup] Active Device: {device} | Max CPU Threads: {num_cpus}")
     if device.type == "cuda":
-        print(f"               GPU Name: {torch.cuda.get_device_name(0)}")
-        print(f"               Total VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+        print(f"                 GPU Name: {torch.cuda.get_device_name(0)}")
+        print(f"                 Total VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
     return device, num_cpus
 
 
-def load_and_preprocess_data(con):
-    # Fetch data sorted strictly by timestamp
-    nifty_df = con.execute("SELECT * FROM nifty_features_1m ORDER BY timestamp ASC").pl()
-    banknifty_df = con.execute("SELECT * FROM banknifty_features_1m ORDER BY timestamp ASC").pl()
+def prepare_tensors(df: pl.DataFrame, feature_cols: list, seq_len: int = 15):
+    feature_matrix = df.select(feature_cols).to_numpy().astype(np.float32)
+    target_returns = df.select("target_5m_return").to_numpy().squeeze().astype(np.float32)
 
-    # Align timestamps prior to imputation to prevent temporal leakage
+    num_samples = len(feature_matrix) - seq_len
+    num_features = len(feature_cols)
+
+    X_seq = np.empty((num_samples, num_features, seq_len), dtype=np.float32)
+    Y_seq = np.empty((num_samples,), dtype=np.float32)
+
+    for i in range(num_samples):
+        X_seq[i] = feature_matrix[i : i + seq_len].T
+        Y_seq[i] = target_returns[i + seq_len]
+
+    return torch.from_numpy(X_seq), torch.from_numpy(Y_seq)
+
+
+def load_and_preprocess_data(con):
+    nifty_df = con.execute("SELECT * FROM nifty_features_1m ORDER BY timestamp").pl()
+    banknifty_df = con.execute("SELECT * FROM banknifty_features_1m ORDER BY timestamp").pl()
+
     nifty_df = nifty_df.with_columns(pl.col("timestamp").cast(pl.Utf8))
     banknifty_df = banknifty_df.with_columns(pl.col("timestamp").cast(pl.Utf8))
-
-    common_ts = nifty_df.select("timestamp").join(
-        banknifty_df.select("timestamp"), on="timestamp", how="inner"
-    ).unique().sort("timestamp")
-
-    nifty_df = nifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
-    banknifty_df = banknifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
 
     meta_cols = {"timestamp", "trading_date", "target_5m_return"}
     candidate_cols = sorted(list((set(nifty_df.columns) & set(banknifty_df.columns)) - meta_cols))
 
-    # Filter columns with missing values > 20%
     feature_cols = []
     for col in candidate_cols:
         nifty_nulls = nifty_df.select(pl.col(col).null_count()).item() / len(nifty_df)
@@ -65,35 +73,18 @@ def load_and_preprocess_data(con):
         if nifty_nulls < 0.20 and bank_nulls < 0.20:
             feature_cols.append(col)
 
-    # Forward fill missing values sequentially (NO backward fill to prevent lookahead)
-    nifty_df = nifty_df.with_columns([pl.col(c).forward_fill().fill_null(0.0) for c in feature_cols])
-    banknifty_df = banknifty_df.with_columns([pl.col(c).forward_fill().fill_null(0.0) for c in feature_cols])
+    nifty_df = nifty_df.with_columns([pl.col(c).forward_fill().backward_fill() for c in feature_cols])
+    banknifty_df = banknifty_df.with_columns([pl.col(c).forward_fill().backward_fill() for c in feature_cols])
 
     req_cols = feature_cols + ["target_5m_return"]
     nifty_df = nifty_df.drop_nulls(subset=req_cols)
     banknifty_df = banknifty_df.drop_nulls(subset=req_cols)
 
-    # Re-align post null-drop
-    common_ts_final = nifty_df.select("timestamp").join(
-        banknifty_df.select("timestamp"), on="timestamp", how="inner"
-    ).sort("timestamp")
-
-    nifty_df = nifty_df.join(common_ts_final, on="timestamp", how="inner").sort("timestamp")
-    banknifty_df = banknifty_df.join(common_ts_final, on="timestamp", how="inner").sort("timestamp")
+    common_ts = nifty_df.select("timestamp").join(banknifty_df.select("timestamp"), on="timestamp", how="inner").unique()
+    nifty_df = nifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
+    banknifty_df = banknifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
 
     return nifty_df, banknifty_df, feature_cols
-
-
-def prepare_tensors(df: pl.DataFrame, feature_cols: list, seq_len: int = 15):
-    feature_matrix = df.select(feature_cols).to_numpy().astype(np.float32)
-    target_returns = df.select("target_5m_return").to_numpy().squeeze().astype(np.float32)
-
-    X_seq, Y_seq = [], []
-    for i in range(seq_len, len(feature_matrix)):
-        X_seq.append(feature_matrix[i - seq_len:i].T)
-        Y_seq.append(target_returns[i])
-
-    return torch.tensor(np.array(X_seq), dtype=torch.float32), torch.tensor(np.array(Y_seq), dtype=torch.float32)
 
 
 def run_training_pipeline():
@@ -106,54 +97,45 @@ def run_training_pipeline():
 
     print(f"[+] Aligned Dataset Size: {len(nifty_df)} rows | Feature Dimension: {len(feature_cols)}")
 
+    ledger = FactorLedger(hazard_threshold=-0.0015, k_neighbors=25)
+    stats = ledger.build_ledger(nifty_df, feature_cols)
+    print(f"[+] Factor Ledger Built: {stats}")
+
     print("[+] Preparing Sequence Tensors...")
     seq_len = 15
     X_nifty, Y_target = prepare_tensors(nifty_df, feature_cols, seq_len=seq_len)
     X_banknifty, _ = prepare_tensors(banknifty_df, feature_cols, seq_len=seq_len)
 
-    # Extract aligned timestamps corresponding to targets for CPCV purging
-    timestamps = nifty_df.select("timestamp").to_numpy().squeeze()[seq_len:]
-
     del nifty_df, banknifty_df
     gc.collect()
 
-    cpcv = CombinatorialPurgedCV(n_splits=5, n_test_splits=1, purge_window=5, embargo_pct=0.01)
-    scaler = torch.amp.GradScaler('cuda') if device.type == "cuda" else None
+    cpcv = CombinatorialPurgedKFold(n_splits=5, n_test_splits=1, pct_embargo=0.01)
+    holding_periods = np.full(len(X_nifty), fill_value=5, dtype=np.int32)
 
     fold = 1
-    best_overall_loss = float('inf')
+    num_workers = min(2, num_cpus) if device.type == "cuda" else 0
 
-    for train_idx, test_idx in cpcv.split(X_nifty, timestamps=timestamps):
+    for train_idx, test_idx in cpcv.split(X_nifty, holding_periods):
         print(f"\n--- CPCV Fold {fold} ---")
 
-        # Fit Factor Ledger strictly on training fold indices to eliminate target/feature leakage
-        ledger = FactorLedger(hazard_threshold=-0.0015, k_neighbors=25)
-        # Apply ledger normalization parameters locally to fold slice
-        X_nifty_train = X_nifty[train_idx]
-        X_bank_train = X_banknifty[train_idx]
-        Y_train = Y_target[train_idx]
-
-        X_nifty_test = X_nifty[test_idx]
-        X_bank_test = X_banknifty[test_idx]
-        Y_test = Y_target[test_idx]
-
-        train_dataset = TensorDataset(X_nifty_train, X_bank_train, Y_train)
+        train_dataset = TensorDataset(X_nifty[train_idx], X_banknifty[train_idx], Y_target[train_idx])
         train_loader = DataLoader(
             train_dataset,
-            batch_size=min(512, len(train_idx)),
+            batch_size=1024,
             shuffle=True,
             pin_memory=(device.type == "cuda"),
-            num_workers=min(4, num_cpus),
-            drop_last=True
+            num_workers=num_workers,
+            persistent_workers=(num_workers > 0)
         )
 
-        test_dataset = TensorDataset(X_nifty_test, X_bank_test, Y_test)
+        test_dataset = TensorDataset(X_nifty[test_idx], X_banknifty[test_idx], Y_target[test_idx])
         test_loader = DataLoader(
             test_dataset,
             batch_size=2048,
             shuffle=False,
             pin_memory=(device.type == "cuda"),
-            num_workers=min(4, num_cpus)
+            num_workers=num_workers,
+            persistent_workers=(num_workers > 0)
         )
 
         model = DualAlphaTCN(in_channels=len(feature_cols)).to(device)
@@ -161,29 +143,23 @@ def run_training_pipeline():
         criterion = DifferentialSharpeLoss()
 
         model.train()
-        for epoch in range(10):
+        for epoch in range(5):
             for batch_xn, batch_xb, batch_y in train_loader:
                 batch_xn = batch_xn.to(device, non_blocking=True)
                 batch_xb = batch_xb.to(device, non_blocking=True)
                 batch_y = batch_y.to(device, non_blocking=True)
 
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
 
-                if device.type == "cuda":
-                    with torch.amp.autocast('cuda'):
-                        z_nifty, z_banknifty = model(batch_xn, batch_xb)
-                        loss = criterion(z_nifty.view(-1), batch_y.view(-1)) + criterion(z_banknifty.view(-1), batch_y.view(-1))
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    z_nifty, z_banknifty = model(batch_xn, batch_xb)
-                    loss = criterion(z_nifty.view(-1), batch_y.view(-1)) + criterion(z_banknifty.view(-1), batch_y.view(-1))
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    optimizer.step()
+                z_nifty, z_banknifty = model(batch_xn, batch_xb)
+                loss = criterion(z_nifty.squeeze(), batch_y) + criterion(z_banknifty.squeeze(), batch_y)
+
+                if torch.isnan(loss):
+                    continue
+
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
 
         model.eval()
         all_z_test = []
@@ -194,33 +170,17 @@ def run_training_pipeline():
                 batch_xn = batch_xn.to(device, non_blocking=True)
                 batch_xb = batch_xb.to(device, non_blocking=True)
 
-                if device.type == "cuda":
-                    with torch.amp.autocast('cuda'):
-                        z_n_test, _ = model(batch_xn, batch_xb)
-                else:
-                    z_n_test, _ = model(batch_xn, batch_xb)
+                z_n_test, _ = model(batch_xn, batch_xb)
 
-                all_z_test.append(z_n_test.cpu())
+                all_z_test.append(z_n_test.squeeze().cpu())
                 all_y_test.append(batch_y.cpu())
 
-        full_z = torch.cat(all_z_test, dim=0).view(-1)
-        full_y = torch.cat(all_y_test, dim=0).view(-1)
+        full_z = torch.cat(all_z_test, dim=0).view(-1).float()
+        full_y = torch.cat(all_y_test, dim=0).view(-1).float()
 
         test_loss = criterion(full_z, full_y).item()
-        print(f"   └─ Fold {fold} Out-of-Sample Sharpe Loss: {test_loss:.4f}")
 
-        # Save checkpoint for best fold model
-        if test_loss < best_overall_loss:
-            best_overall_loss = test_loss
-            checkpoint_path = MODEL_SAVE_DIR / "dual_alpha_tcn_best.pt"
-            torch.save({
-                'fold': fold,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'test_loss': test_loss,
-                'feature_cols': feature_cols
-            }, checkpoint_path)
-            print(f"   └─ [Checkpoint Saved] Best model updated -> {checkpoint_path}")
+        print(f"   └─ Fold {fold} Test Sharpe Loss: {test_loss:.4f}")
 
         del model, train_loader, test_loader, train_dataset, test_dataset
         if device.type == "cuda":
@@ -228,8 +188,6 @@ def run_training_pipeline():
         gc.collect()
 
         fold += 1
-
-    print(f"\n[+] Pipeline Training Completed. Best Out-of-Sample Loss: {best_overall_loss:.4f}")
 
 
 if __name__ == "__main__":
