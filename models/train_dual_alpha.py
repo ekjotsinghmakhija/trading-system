@@ -165,8 +165,10 @@ def run_training_pipeline():
                 all_z_test.append(z_n_test.cpu())
                 all_y_test.append(batch_y.cpu())
 
-        full_z = torch.cat(all_z_test, dim=0)
-        full_y = torch.cat(all_y_test, dim=0)
+        # Ensure 1D shape alignment to prevent (N, 1) * (N,) outer-product broadcasting
+        full_z = torch.cat(all_z_test, dim=0).view(-1)
+        full_y = torch.cat(all_y_test, dim=0).view(-1)
+
         test_loss = criterion(full_z, full_y).item()
 
         print(f"  └─ Fold {fold} Test Sharpe Loss: {test_loss:.4f}")
