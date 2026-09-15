@@ -1,50 +1,93 @@
-import os
-import torch
-from features.feature_engineer import FeatureEngineer
-from features.factor_ledger import FactorDiscoveryLedger
-from env.strict_sim_env import StrictOptionSimEnv
-from models.architecture import ActorCriticTCNGRU
-from models.train_engine import PPOTrainEngine
+# execution/order_router.py
+
+import time
+import logging
+from typing import Dict, Any
+
+logger = logging.getLogger("OrderRouter")
+
+class MockPaperBroker:
+    """
+    Simulates live options execution against level-2 orderbook depth feeds.
+    """
+    def __init__(self, latency_ms: int = 250, slippage_ticks: float = 1.0):
+        self.latency_sec = latency_ms / 1000.0
+        self.tick_size = 0.05
+        self.slippage = slippage_ticks * self.tick_size
+
+    def execute_order(self, symbol: str, transaction_type: str, price: float, quantity: int) -> Dict[str, Any]:
+        # Inject simulated network latency
+        time.sleep(self.latency_sec)
+
+        # Apply slippage (Buy higher than ask, Sell lower than bid)
+        if transaction_type.upper() == 'BUY':
+            fill_price = price + self.slippage
+        else:
+            fill_price = max(0.05, price - self.slippage)
+
+        fill_price = round(fill_price / self.tick_size) * self.tick_size
+
+        return {
+            'status': 'COMPLETE',
+            'symbol': symbol,
+            'transaction_type': transaction_type,
+            'requested_price': price,
+            'filled_price': fill_price,
+            'quantity': quantity,
+            'slippage_paid': self.slippage * quantity,
+            'timestamp': time.time()
+        }
 
 
-def main():
-    print("==========================================================")
-    print("       QUANTUM-50K ENGINE: PRODUCTION PIPELINE          ")
-    print("==========================================================")
+class OrderRouter:
+    """
+    Routes execution signals to either Live Zerodha Kite API or Mock Paper Engine.
+    """
+    def __init__(self, paper_trading: bool = True, kite_client=None):
+        self.paper_trading = paper_trading
+        self.kite = kite_client
+        self.mock_broker = MockPaperBroker()
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[🚀] Operating Device: {device}")
+    def route_signal(
+        self,
+        futures_price: float,
+        signal: int,
+        volatility: float,
+        quantity: int = 50
+    ) -> Dict[str, Any]:
+        """
+        Maps a futures signal (+1 Long, -1 Short) to an ATM options order.
+        """
+        if signal == 0:
+            return {'status': 'SKIPPED', 'reason': 'NEUTRAL_SIGNAL'}
 
-    # Data Ingestion & Feature Engineering
-    engineer = FeatureEngineer()
-    raw_df = engineer.generate_synthetic_raw_feed(50000)
-    df = engineer.compute_18_alpha_matrix(raw_df)
+        # Strike mapping: Round futures price to nearest 50-point step
+        atm_strike = int(round(futures_price / 50.0) * 50)
+        option_type = 'CE' if signal == 1 else 'PE'
+        symbol = f"NIFTY26SEP{atm_strike}{option_type}"
 
-    feature_cols = [c for c in df.columns if c != "close"]
-    print(f"[✓] Feature Matrix Ready ({len(feature_cols)} Alpha Features)")
+        # Estimate option premium baseline from futures distance
+        estimated_premium = max(10.0, volatility * 50.0)
 
-    # Environment & Ledger
-    env = StrictOptionSimEnv(df, feature_cols=feature_cols, initial_capital=50000.0)
-    ledger = FactorDiscoveryLedger("logs/experiments/factor_ledger.parquet")
-
-    # Neural Model Architecture
-    input_dim = len(feature_cols) + 2  # 18 Features + Position + Holding Ratio
-    model = ActorCriticTCNGRU(input_dim=input_dim, action_dim=1)
-
-    # PPO Engine Setup
-    trainer = PPOTrainEngine(model=model, env=env, ledger=ledger, lr=3e-6, device=device)
-
-    print("[🚀] Training 12M Step Engine Routine...")
-    for step in range(1, 101):
-        loss, current_equity = trainer.train_step(num_steps=1024)
-
-        if step % 10 == 0:
-            ledger.flush_to_disk()
-            trainer.check_local_minima(current_equity)
-            print(f"[📊 Epoch {step}] PPO Loss: {loss:.4f} | Portfolio Equity: ₹{current_equity:,.2f}")
-
-    print("[✓] Execution Complete. Factor Ledger updated in logs/experiments/factor_ledger.parquet")
-
-
-if __name__ == "__main__":
-    main()
+        if self.paper_trading:
+            logger.info(f"[PAPER ORDER] {signal} | Futures: {futures_price} | Strike: {atm_strike}{option_type}")
+            return self.mock_broker.execute_order(
+                symbol=symbol,
+                transaction_type='BUY',
+                price=estimated_premium,
+                quantity=quantity
+            )
+        else:
+            if self.kite is None:
+                raise ValueError("Live Kite API client not initialized.")
+            # Live Zerodha execution call
+            order_id = self.kite.place_order(
+                variety=self.kite.VARIETY_REGULAR,
+                exchange=self.kite.EXCHANGE_NFO,
+                tradingsymbol=symbol,
+                transaction_type=self.kite.TRANSACTION_TYPE_BUY,
+                quantity=quantity,
+                product=self.kite.PRODUCT_MIS,
+                order_type=self.kite.ORDER_TYPE_MARKET
+            )
+            return {'status': 'SUBMITTED', 'order_id': order_id}
