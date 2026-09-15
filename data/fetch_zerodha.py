@@ -1,165 +1,82 @@
+# data/fetch_zerodha.py
+
 import os
+import sys
 import time
-import pandas as pd
 from datetime import datetime, timedelta
-from dotenv import load_dotenv
+from pathlib import Path
+import pandas as pd
 from kiteconnect import KiteConnect
-from kiteconnect.exceptions import NetworkException
-import requests
 
-load_dotenv()
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PARQUET_DIR = PROJECT_ROOT / "data" / "parquet"
+PARQUET_DIR.mkdir(parents=True, exist_ok=True)
+
+# Read API Key and Access Token
+def get_kite_client():
+    token_path = PROJECT_ROOT / "access_token.txt"
+    if not token_path.exists():
+        raise FileNotFoundError("access_token.txt not found. Ensure API token is saved.")
+
+    with open(token_path, "r") as f:
+        access_token = f.read().strip()
+
+    api_key = os.getenv("KITE_API_KEY", "")
+    kite = KiteConnect(api_key=api_key)
+    kite.set_access_token(access_token)
+    return kite
 
 
-class ZerodhaDataFetcher:
-    """Production-grade data extraction module with network retry logic & strict API limit handling."""
+def fetch_continuous_futures(kite, symbol_name: str, instrument_token: int, start_date: str, end_date: str):
+    print(f"[+] Fetching historical data for {symbol_name} ({start_date} to {end_date})...")
 
-    def __init__(self, api_key: str, api_secret: str, token_path: str = "access_token.txt"):
-        self.api_key = api_key
-        self.api_secret = api_secret
-        self.token_path = token_path
-        self.kite = KiteConnect(api_key=self.api_key)
+    current_start = datetime.strptime(start_date, "%Y-%m-%d")
+    final_end = datetime.strptime(end_date, "%Y-%m-%d")
 
-    def authenticate(self):
-        """Authenticates using stored access token or prompts for new login."""
-        if os.path.exists(self.token_path):
-            with open(self.token_path, "r") as f:
-                access_token = f.read().strip()
-            self.kite.set_access_token(access_token)
-            print("[+] Successfully loaded access token from file.")
-        else:
-            print(f"[!] Login URL: {self.kite.login_url()}")
-            request_token = input("Enter request_token from redirected URL: ").strip()
-            data = self.kite.generate_session(request_token, api_secret=self.api_secret)
-            access_token = data["access_token"]
-            with open(self.token_path, "w") as f:
-                f.write(access_token)
-            self.kite.set_access_token(access_token)
-            print("[+] Authentication complete. Token saved locally.")
+    records = []
 
-    def _execute_with_retry(self, func, *args, max_retries=5, **kwargs):
-        """Handles DNS/network drops with exponential backoff."""
-        for attempt in range(1, max_retries + 1):
-            try:
-                return func(*args, **kwargs)
-            except (requests.exceptions.RequestException, NetworkException, Exception) as e:
-                wait_time = attempt * 3
-                print(f"[!] Network Error: {e}. Retrying {attempt}/{max_retries} in {wait_time}s...")
-                time.sleep(wait_time)
-        raise ConnectionError(f"Failed {func.__name__} after {max_retries} retries due to connection drops.")
+    # Fetch in 60-day chunks (KiteConnect 1-min limit per call)
+    while current_start < final_end:
+        current_end = min(current_start + timedelta(days=60), final_end)
 
-    def get_spot_token(self, symbol: str = "NIFTY 50") -> int:
-        """Fetches spot index instrument token."""
-        instruments = pd.DataFrame(self._execute_with_retry(self.kite.instruments, "NSE"))
-        match = instruments[instruments["tradingsymbol"] == symbol]
-        if match.empty:
-            raise ValueError(f"Symbol {symbol} not found in NSE instrument list.")
-        token = int(match.iloc[0]["instrument_token"])
-        print(f"[+] Selected Spot Instrument: {symbol} | Token: {token}")
-        return token
-
-    def get_current_future_token(self, symbol: str = "NIFTY") -> int:
-        """Fetches current active month future contract token from NFO."""
-        instruments = pd.DataFrame(self._execute_with_retry(self.kite.instruments, "NFO"))
-        futs = instruments[(instruments["name"] == symbol) & (instruments["segment"] == "NFO-FUT")]
-        current_fut = futs.sort_values(by="expiry").iloc[0]
-        print(f"[+] Selected Active Future: {current_fut['tradingsymbol']} | Token: {current_fut['instrument_token']}")
-        return int(current_fut["instrument_token"])
-
-    def fetch_historical_data(
-        self,
-        instrument_token: int,
-        start_date: datetime,
-        end_date: datetime,
-        output_path: str,
-        interval: str = "minute",
-        continuous: bool = False,
-        include_oi: bool = False
-    ):
-        """Fetches historical candles respecting Zerodha interval limits."""
-        max_days = 2000 if interval == "day" else 60
-        full_records = []
-        current_start = start_date
-
-        while current_start < end_date:
-            current_end = min(current_start + timedelta(days=max_days), end_date)
-            print(f"Extracting [{interval}]: {current_start.strftime('%Y-%m-%d')} -> {current_end.strftime('%Y-%m-%d')}...")
-
-            records = self._execute_with_retry(
-                self.kite.historical_data,
+        try:
+            data = kite.historical_data(
                 instrument_token=instrument_token,
-                from_date=current_start,
-                to_date=current_end,
-                interval=interval,
-                continuous=continuous,
-                oi=include_oi
+                from_date=current_start.strftime("%Y-%m-%d %H:%M:%S"),
+                to_date=current_end.strftime("%Y-%m-%d %H:%M:%S"),
+                interval="minute",
+                continuous=True,
+                oi=True
             )
+            records.extend(data)
+            time.sleep(0.35)  # Rate limiting
+        except Exception as e:
+            print(f"[-] Error fetching chunk {current_start.strftime('%Y-%m-%d')} to {current_end.strftime('%Y-%m-%d')}: {e}")
+            time.sleep(1)
 
-            if records:
-                full_records.extend(records)
+        current_start = current_end + timedelta(days=1)
 
-            current_start = current_end + timedelta(days=1)
-            time.sleep(0.35)
+    df = pd.DataFrame(records)
+    if not df.empty:
+        df["date"] = pd.to_datetime(df["date"])
+        df.sort_values("date", inplace=True)
+        df.drop_duplicates(subset=["date"], inplace=True)
 
-        if not full_records:
-            print(f"[!] Warning: No records retrieved for token {instrument_token}.")
-            return
-
-        df = pd.DataFrame(full_records)
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        df.to_csv(output_path, index=False)
-        print(f"[+] Saved to {output_path} ({len(df):,} total rows).")
+        out_path = PARQUET_DIR / f"{symbol_name.lower()}_futures_1m_2018_2026.parquet"
+        df.to_parquet(out_path, index=False)
+        print(f"[✓] Saved {len(df)} rows for {symbol_name} -> {out_path}")
+    else:
+        print(f"[!] No data retrieved for {symbol_name}.")
 
 
 if __name__ == "__main__":
-    API_KEY = os.getenv("ZERODHA_API_KEY")
-    API_SECRET = os.getenv("ZERODHA_API_SECRET")
+    try:
+        kite = get_kite_client()
+        # Replace instrument tokens with your specific Zerodha continuous futures tokens
+        NIFTY_FUT_TOKEN = 256265   # Example NIFTY FUT continuous token
+        BANKNIFTY_FUT_TOKEN = 260105 # Example BANKNIFTY FUT continuous token
 
-    if not API_KEY or not API_SECRET:
-        raise ValueError("Missing ZERODHA_API_KEY or ZERODHA_API_SECRET in environment variables.")
-
-    fetcher = ZerodhaDataFetcher(api_key=API_KEY, api_secret=API_SECRET)
-    fetcher.authenticate()
-
-    START_2018 = datetime(2018, 1, 1)
-    END_DATE = datetime(2026, 8, 31)
-
-    # 1. Intraday Spot Indices 1-Minute Data (2018-2026, Includes 2020 Crash)
-    spot_targets = [
-        ("NIFTY 50", "data/raw/nifty_spot_raw.csv"),
-        ("NIFTY BANK", "data/raw/banknifty_spot_raw.csv"),
-    ]
-
-    for symbol, path in spot_targets:
-        token = fetcher.get_spot_token(symbol)
-        fetcher.fetch_historical_data(
-            instrument_token=token,
-            start_date=START_2018,
-            end_date=END_DATE,
-            output_path=path,
-            interval="minute",
-            continuous=False,
-            include_oi=False
-        )
-
-    # 2. Daily Continuous Futures Data (2018-2026)
-    fut_token = fetcher.get_current_future_token("NIFTY")
-    fetcher.fetch_historical_data(
-        instrument_token=fut_token,
-        start_date=START_2018,
-        end_date=END_DATE,
-        output_path="data/raw/nifty_futures_daily_continuous_raw.csv",
-        interval="day",
-        continuous=True,
-        include_oi=True
-    )
-
-    # 3. Active Month NIFTY Futures Intraday 1-Minute Data
-    fetcher.fetch_historical_data(
-        instrument_token=fut_token,
-        start_date=datetime(2026, 1, 1),
-        end_date=END_DATE,
-        output_path="data/raw/nifty_futures_active_raw.csv",
-        interval="minute",
-        continuous=False,
-        include_oi=True
-    )
+        fetch_continuous_futures(kite, "NIFTY", NIFTY_FUT_TOKEN, "2018-01-01", "2026-09-16")
+        fetch_continuous_futures(kite, "BANKNIFTY", BANKNIFTY_FUT_TOKEN, "2018-01-01", "2026-09-16")
+    except Exception as e:
+        print(f"[-] Fetch execution failed: {e}")

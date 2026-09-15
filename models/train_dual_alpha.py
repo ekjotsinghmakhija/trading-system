@@ -9,7 +9,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-import duckdb
 import torch
 import numpy as np
 import polars as pl
@@ -17,177 +16,131 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from models.architecture import DualAlphaTCN
 from models.train_engine import DifferentialSharpeLoss
-from eval.evaluate_cpcv import CombinatorialPurgedKFold
-from features.factor_ledger import FactorLedger
+from execution.order_router import FuturesToOptionsInterpreter
 
-DB_PATH = "data/duckdb/market_data.duckdb"
-
-if torch.cuda.is_available():
-    torch.set_float32_matmul_precision('high')
-    torch.backends.cudnn.benchmark = True
+PARQUET_DIR = PROJECT_ROOT / "data" / "parquet"
 
 
-def setup_hardware():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    num_cpus = os.cpu_count() or 4
-    torch.set_num_threads(num_cpus)
-    print(f"[Hardware Setup] Active Device: {device} | Max CPU Threads: {num_cpus}")
-    if device.type == "cuda":
-        print(f"                 GPU Name: {torch.cuda.get_device_name(0)}")
-        print(f"                 Total VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
-    return device, num_cpus
+def load_train_test_split():
+    nifty_path = PARQUET_DIR / "nifty_features_1m.parquet"
+    bank_path = PARQUET_DIR / "banknifty_features_1m.parquet"
+
+    nifty_df = pl.read_parquet(nifty_path)
+    bank_df = pl.read_parquet(bank_path)
+
+    # Align timestamps
+    common_ts = nifty_df.select("timestamp").join(bank_df.select("timestamp"), on="timestamp", how="inner").unique()
+    nifty_df = nifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
+    bank_df = bank_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
+
+    feature_cols = ["bar_change", "volatility_range", "turnover", "sma_15", "sma_60", "std_30", "zscore_close", "rsi_14", "vwap_deviation"]
+
+    # Split train (2018-2025) and test (2026 YTD)
+    nifty_df = nifty_df.with_columns(pl.col("timestamp").cast(pl.Datetime))
+    bank_df = bank_df.with_columns(pl.col("timestamp").cast(pl.Datetime))
+
+    train_nifty = nifty_df.filter(pl.col("timestamp") < pl.datetime(2026, 1, 1))
+    test_nifty = nifty_df.filter(pl.col("timestamp") >= pl.datetime(2026, 1, 1))
+
+    train_bank = bank_df.filter(pl.col("timestamp") < pl.datetime(2026, 1, 1))
+    test_bank = bank_df.filter(pl.col("timestamp") >= pl.datetime(2026, 1, 1))
+
+    return train_nifty, test_nifty, train_bank, test_bank, feature_cols
 
 
-def prepare_tensors(df: pl.DataFrame, feature_cols: list, seq_len: int = 15):
-    feature_matrix = df.select(feature_cols).to_numpy().astype(np.float32)
-    target_returns = df.select("target_5m_return").to_numpy().squeeze().astype(np.float32)
+def create_tensors(df_nifty: pl.DataFrame, df_bank: pl.DataFrame, feature_cols: list, seq_len: int = 15):
+    f_nifty = df_nifty.select(feature_cols).to_numpy().astype(np.float32)
+    f_bank = df_bank.select(feature_cols).to_numpy().astype(np.float32)
+    targets = df_nifty.select("target_5m_return").to_numpy().squeeze().astype(np.float32)
 
-    num_samples = len(feature_matrix) - seq_len
-    num_features = len(feature_cols)
-
-    X_seq = np.empty((num_samples, num_features, seq_len), dtype=np.float32)
-    Y_seq = np.empty((num_samples,), dtype=np.float32)
+    num_samples = len(f_nifty) - seq_len
+    X_nifty = np.empty((num_samples, len(feature_cols), seq_len), dtype=np.float32)
+    X_bank = np.empty((num_samples, len(feature_cols), seq_len), dtype=np.float32)
+    Y_target = np.empty((num_samples,), dtype=np.float32)
 
     for i in range(num_samples):
-        X_seq[i] = feature_matrix[i : i + seq_len].T
-        Y_seq[i] = target_returns[i + seq_len]
+        X_nifty[i] = f_nifty[i : i + seq_len].T
+        X_bank[i] = f_bank[i : i + seq_len].T
+        Y_target[i] = targets[i + seq_len]
 
-    return torch.from_numpy(X_seq), torch.from_numpy(Y_seq)
-
-
-def load_and_preprocess_data(con):
-    nifty_df = con.execute("SELECT * FROM nifty_features_1m ORDER BY timestamp").pl()
-    banknifty_df = con.execute("SELECT * FROM banknifty_features_1m ORDER BY timestamp").pl()
-
-    nifty_df = nifty_df.with_columns(pl.col("timestamp").cast(pl.Utf8))
-    banknifty_df = banknifty_df.with_columns(pl.col("timestamp").cast(pl.Utf8))
-
-    meta_cols = {"timestamp", "trading_date", "target_5m_return"}
-    candidate_cols = sorted(list((set(nifty_df.columns) & set(banknifty_df.columns)) - meta_cols))
-
-    feature_cols = []
-    for col in candidate_cols:
-        nifty_nulls = nifty_df.select(pl.col(col).null_count()).item() / len(nifty_df)
-        bank_nulls = banknifty_df.select(pl.col(col).null_count()).item() / len(banknifty_df)
-        if nifty_nulls < 0.20 and bank_nulls < 0.20:
-            feature_cols.append(col)
-
-    nifty_df = nifty_df.with_columns([pl.col(c).forward_fill().backward_fill() for c in feature_cols])
-    banknifty_df = banknifty_df.with_columns([pl.col(c).forward_fill().backward_fill() for c in feature_cols])
-
-    req_cols = feature_cols + ["target_5m_return"]
-    nifty_df = nifty_df.drop_nulls(subset=req_cols)
-    banknifty_df = banknifty_df.drop_nulls(subset=req_cols)
-
-    common_ts = nifty_df.select("timestamp").join(banknifty_df.select("timestamp"), on="timestamp", how="inner").unique()
-    nifty_df = nifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
-    banknifty_df = banknifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
-
-    return nifty_df, banknifty_df, feature_cols
+    return torch.from_numpy(X_nifty), torch.from_numpy(X_bank), torch.from_numpy(Y_target)
 
 
-def run_training_pipeline():
-    device, num_cpus = setup_hardware()
+def run_pipeline():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[+] Device: {device}")
 
-    print("[+] Connecting to DuckDB...")
-    con = duckdb.connect(DB_PATH)
-    nifty_df, banknifty_df, feature_cols = load_and_preprocess_data(con)
-    con.close()
+    train_nifty, test_nifty, train_bank, test_bank, feature_cols = load_train_test_split()
+    print(f"[+] Train rows (2018-2025): {len(train_nifty)} | Test rows (2026 YTD): {len(test_nifty)}")
 
-    print(f"[+] Aligned Dataset Size: {len(nifty_df)} rows | Feature Dimension: {len(feature_cols)}")
+    X_train_n, X_train_b, Y_train = create_tensors(train_nifty, train_bank, feature_cols)
+    X_test_n, X_test_b, Y_test = create_tensors(test_nifty, test_bank, feature_cols)
 
-    ledger = FactorLedger(hazard_threshold=-0.0015, k_neighbors=25)
-    stats = ledger.build_ledger(nifty_df, feature_cols)
-    print(f"[+] Factor Ledger Built: {stats}")
+    train_loader = DataLoader(TensorDataset(X_train_n, X_train_b, Y_train), batch_size=1024, shuffle=True)
+    test_loader = DataLoader(TensorDataset(X_test_n, X_test_b, Y_test), batch_size=2048, shuffle=False)
 
-    print("[+] Preparing Sequence Tensors...")
-    seq_len = 15
-    X_nifty, Y_target = prepare_tensors(nifty_df, feature_cols, seq_len=seq_len)
-    X_banknifty, _ = prepare_tensors(banknifty_df, feature_cols, seq_len=seq_len)
+    model = DualAlphaTCN(in_channels=len(feature_cols)).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    criterion = DifferentialSharpeLoss()
 
-    del nifty_df, banknifty_df
-    gc.collect()
+    print("\n[+] Training Model on 2018–2025 Futures Data...")
+    model.train()
+    for epoch in range(1, 11):
+        total_loss = 0.0
+        for batch_xn, batch_xb, batch_y in train_loader:
+            batch_xn, batch_xb, batch_y = batch_xn.to(device), batch_xb.to(device), batch_y.to(device)
 
-    cpcv = CombinatorialPurgedKFold(n_splits=5, n_test_splits=1, pct_embargo=0.01)
-    holding_periods = np.full(len(X_nifty), fill_value=5, dtype=np.int32)
+            optimizer.zero_grad(set_to_none=True)
+            z_n, z_b = model(batch_xn, batch_xb)
+            loss = criterion(z_n.squeeze(), batch_y) + criterion(z_b.squeeze(), batch_y)
 
-    fold = 1
-    num_workers = min(2, num_cpus) if device.type == "cuda" else 0
-
-    for train_idx, test_idx in cpcv.split(X_nifty, holding_periods):
-        print(f"\n--- CPCV Fold {fold} ---")
-
-        train_dataset = TensorDataset(X_nifty[train_idx], X_banknifty[train_idx], Y_target[train_idx])
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=1024,
-            shuffle=True,
-            pin_memory=(device.type == "cuda"),
-            num_workers=num_workers,
-            persistent_workers=(num_workers > 0)
-        )
-
-        test_dataset = TensorDataset(X_nifty[test_idx], X_banknifty[test_idx], Y_target[test_idx])
-        test_loader = DataLoader(
-            test_dataset,
-            batch_size=2048,
-            shuffle=False,
-            pin_memory=(device.type == "cuda"),
-            num_workers=num_workers,
-            persistent_workers=(num_workers > 0)
-        )
-
-        model = DualAlphaTCN(in_channels=len(feature_cols)).to(device)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-        criterion = DifferentialSharpeLoss()
-
-        model.train()
-        for epoch in range(10):
-            for batch_xn, batch_xb, batch_y in train_loader:
-                batch_xn = batch_xn.to(device, non_blocking=True)
-                batch_xb = batch_xb.to(device, non_blocking=True)
-                batch_y = batch_y.to(device, non_blocking=True)
-
-                optimizer.zero_grad(set_to_none=True)
-
-                z_nifty, z_banknifty = model(batch_xn, batch_xb)
-                loss = criterion(z_nifty.squeeze(), batch_y) + criterion(z_banknifty.squeeze(), batch_y)
-
-                if torch.isnan(loss):
-                    continue
-
+            if not torch.isnan(loss):
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
+                total_loss += loss.item()
 
-        model.eval()
-        all_z_test = []
-        all_y_test = []
+        print(f"   Epoch {epoch:02d} | Train Sharpe Loss: {total_loss / len(train_loader):.4f}")
 
-        with torch.no_grad():
-            for batch_xn, batch_xb, batch_y in test_loader:
-                batch_xn = batch_xn.to(device, non_blocking=True)
-                batch_xb = batch_xb.to(device, non_blocking=True)
+    # Out-of-Sample Evaluation on 2026 YTD
+    print("\n[+] Evaluating Out-of-Sample Strategy on 2026 YTD Data...")
+    model.eval()
+    all_signals = []
+    all_returns = []
 
-                z_n_test, _ = model(batch_xn, batch_xb)
+    with torch.no_grad():
+        for batch_xn, batch_xb, batch_y in test_loader:
+            batch_xn, batch_xb = batch_xn.to(device), batch_xb.to(device)
+            z_n, _ = model(batch_xn, batch_xb)
 
-                all_z_test.append(z_n_test.squeeze().cpu())
-                all_y_test.append(batch_y.cpu())
+            all_signals.append(z_n.squeeze().cpu().numpy())
+            all_returns.append(batch_y.numpy())
 
-        full_z = torch.cat(all_z_test, dim=0).view(-1).float()
-        full_y = torch.cat(all_y_test, dim=0).view(-1).float()
+    signals = np.concatenate(all_signals)
+    returns = np.concatenate(all_returns)
 
-        test_loss = criterion(full_z, full_y).item()
+    # Convert continuous signals [-1, 1] to trade positions
+    interpreter = FuturesToOptionsInterpreter(long_threshold=0.35, short_threshold=-0.35)
+    positions = np.zeros_like(signals)
+    positions[signals >= 0.35] = 1.0   # Long / Buy Call
+    positions[signals <= -0.35] = -1.0  # Short / Buy Put
 
-        print(f"   └─ Fold {fold} Test Sharpe Loss: {test_loss:.4f}")
+    strategy_returns = positions * returns
+    cum_returns = np.cumsum(strategy_returns)
 
-        del model, train_loader, test_loader, train_dataset, test_dataset
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-        gc.collect()
+    total_return_pct = np.sum(strategy_returns) * 100
+    daily_sharpe = np.mean(strategy_returns) / (np.std(strategy_returns) + 1e-6) * np.sqrt(375)
+    win_rate = (np.sum(strategy_returns > 0) / (np.sum(positions != 0) + 1e-6)) * 100
 
-        fold += 1
+    print("=" * 50)
+    print("      2026 YTD BACKTEST RESULTS (UNLEVERAGED)     ")
+    print("=" * 50)
+    print(f"  Total Trades Taken : {np.sum(positions != 0)}")
+    print(f"  Win Rate           : {win_rate:.2f}%")
+    print(f"  Cumulative Return  : {total_return_pct:.2f}%")
+    print(f"  Annualized Sharpe  : {daily_sharpe:.2f}")
+    print("=" * 50)
 
 
 if __name__ == "__main__":
-    run_training_pipeline()
+    run_pipeline()
