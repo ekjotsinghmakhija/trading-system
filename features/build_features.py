@@ -1,85 +1,86 @@
-# features/build_features.py
-
-from pathlib import Path
-import polars as pl
 import numpy as np
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-PARQUET_DIR = PROJECT_ROOT / "data" / "parquet"
+import pandas as pd
 
 
-def compute_technical_indicators(df: pl.DataFrame) -> pl.DataFrame:
+def compute_features_leak_free(
+    df: pd.DataFrame, shift_signals: bool = True
+) -> pd.DataFrame:
+    """Computes technical features strictly using historical information.
+
+    Prevents look-ahead bias by ensuring zero future-data leakage in feature
+    calculations.
     """
-    Computes technical indicators and 5-minute forward returns without data leakage.
-    """
-    df = df.sort("date")
+    df = df.copy()
 
-    # Basic Features
-    df = df.with_columns([
-        (pl.col("close") - pl.col("open")).alias("bar_change"),
-        ((pl.col("high") - pl.col("low")) / pl.col("close")).alias("volatility_range"),
-        (pl.col("volume") * pl.col("close")).alias("turnover"),
-    ])
+    # Ensure chronological sort
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df = df.sort_values("timestamp").reset_index(drop=True)
 
-    # Moving Averages & Z-Scores
-    df = df.with_columns([
-        pl.col("close").rolling_mean(window_size=15).alias("sma_15"),
-        pl.col("close").rolling_mean(window_size=60).alias("sma_60"),
-        pl.col("close").rolling_std(window_size=30).alias("std_30"),
-    ])
+    required_cols = {"open", "high", "low", "close", "volume"}
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise KeyError(f"Missing required price/volume columns: {missing}")
 
-    df = df.with_columns([
-        ((pl.col("close") - pl.col("sma_15")) / (pl.col("std_30") + 1e-6)).alias("zscore_close"),
-    ])
+    # --- 1. PAST-ONLY FEATURES (Computed strictly on current/past bars) ---
 
-    # RSI (14)
-    delta = df["close"].diff()
-    gain = pl.when(delta > 0).then(delta).otherwise(0)
-    loss = pl.when(delta < 0).then(-delta).otherwise(0)
+    # Log returns (t relative to t-1)
+    df["feat_log_ret_1"] = np.log(df["close"] / df["close"].shift(1))
+    df["feat_log_ret_5"] = np.log(df["close"] / df["close"].shift(5))
 
-    avg_gain = gain.rolling_mean(window_size=14)
-    avg_loss = loss.rolling_mean(window_size=14)
-    rs = avg_gain / (avg_loss + 1e-6)
-    rsi = 100 - (100 / (1 + rs))
-    df = df.with_columns(rsi.alias("rsi_14"))
+    # Rolling Volatility (strictly backward-looking window)
+    df["feat_volatility_20"] = (
+        df["feat_log_ret_1"].rolling(window=20, min_periods=20).std()
+    )
 
-    # VWAP (Cumulative per day)
-    df = df.with_columns(pl.col("date").dt.date().alias("trading_date"))
-    df = df.with_columns([
-        ((pl.col("volume") * (pl.col("high") + pl.col("low") + pl.col("close")) / 3)
-         .cum_sum().over("trading_date") /
-         (pl.col("volume").cum_sum().over("trading_date") + 1e-6)).alias("vwap")
-    ])
+    # Moving Average Ratio (Close relative to rolling mean)
+    ma_20 = df["close"].rolling(window=20, min_periods=20).mean()
+    df["feat_ma_ratio_20"] = df["close"] / ma_20 - 1.0
 
-    df = df.with_columns([
-        ((pl.col("close") - pl.col("vwap")) / pl.col("vwap")).alias("vwap_deviation")
-    ])
+    # Rolling Z-Score of Close Price
+    std_20 = df["close"].rolling(window=20, min_periods=20).std()
+    df["feat_zscore_20"] = (df["close"] - ma_20) / (std_20 + 1e-8)
 
-    # Target: 5-minute forward return
-    df = df.with_columns([
-        ((pl.col("close").shift(-5) - pl.col("close")) / pl.col("close")).alias("target_5m_return")
-    ])
+    # Average True Range (ATR)
+    high_low = df["high"] - df["low"]
+    high_cp = (df["high"] - df["close"].shift(1)).abs()
+    low_cp = (df["low"] - df["close"].shift(1)).abs()
+    tr = pd.concat([high_low, high_cp, low_cp], axis=1).max(axis=1)
+    df["feat_atr_14"] = tr.rolling(window=14, min_periods=14).mean()
 
-    # Rename date to timestamp for consistency
-    df = df.rename({"date": "timestamp"})
-    return df.drop_nulls()
+    # Relative Volume (Volume / 20-bar SMA Volume)
+    vol_ma_20 = df["volume"].rolling(window=20, min_periods=20).mean()
+    df["feat_rel_volume"] = df["volume"] / (vol_ma_20 + 1e-8)
 
+    # --- 2. PREVENT SAME-BAR LOOK-AHEAD BIAS ---
+    # If trades execute at bar 't' close or open based on features at 't',
+    # features MUST be shifted by +1 so bar 't' only uses data up to 't-1'.
+    feature_cols = [c for c in df.columns if c.startswith("feat_")]
+    if shift_signals:
+        df[feature_cols] = df[feature_cols].shift(1)
 
-def process_all_futures():
-    for symbol in ["nifty", "banknifty"]:
-        raw_file = PARQUET_DIR / f"{symbol}_futures_1m_2018_2026.parquet"
-        if not raw_file.exists():
-            print(f"[-] File not found: {raw_file}. Run data/fetch_zerodha.py first.")
-            continue
+    # --- 3. TARGET DEFINITION (Strict Forward Returns) ---
+    # Target at bar 't' = Return from close(t) to close(t+1)
+    # Execution occurs AFTER features at 't' are known.
+    df["target_1b"] = (df["close"].shift(-1) / df["close"]) - 1.0
 
-        print(f"[+] Engineering features for {symbol.upper()}...")
-        df = pl.read_parquet(raw_file)
-        featured_df = compute_technical_indicators(df)
+    # Drop NaNs created by rolling windows, feature shifting, and target shifting
+    df = df.dropna().reset_index(drop=True)
 
-        out_file = PARQUET_DIR / f"{symbol}_features_1m.parquet"
-        featured_df.write_parquet(out_file)
-        print(f"[✓] Saved {len(featured_df)} feature rows -> {out_file}")
+    return df
 
 
 if __name__ == "__main__":
-    process_all_futures()
+    # Test stub
+    sample_data = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-01-01", periods=100, freq="1h"),
+            "open": np.random.randn(100).cumsum() + 100,
+            "high": np.random.randn(100).cumsum() + 102,
+            "low": np.random.randn(100).cumsum() + 98,
+            "close": np.random.randn(100).cumsum() + 100,
+            "volume": np.random.randint(100, 1000, size=100),
+        }
+    )
+    processed = compute_features_leak_free(sample_data)
+    print(f"Features computed. Shape: {processed.shape}")

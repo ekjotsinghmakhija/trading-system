@@ -1,146 +1,144 @@
-# models/train_dual_alpha.py
-
-import os
-import sys
-import gc
-from pathlib import Path
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-import torch
 import numpy as np
-import polars as pl
-from torch.utils.data import DataLoader, TensorDataset
-
-from models.architecture import DualAlphaTCN
-from models.train_engine import DifferentialSharpeLoss
-from execution.order_router import FuturesToOptionsInterpreter
-
-PARQUET_DIR = PROJECT_ROOT / "data" / "parquet"
+import pandas as pd
+from sklearn.linear_model import Ridge
+from sklearn.preprocessing import StandardScaler
 
 
-def load_train_test_split():
-    nifty_path = PARQUET_DIR / "nifty_features_1m.parquet"
-    bank_path = PARQUET_DIR / "banknifty_features_1m.parquet"
+def purged_walk_forward_cv(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    target_col: str = "target_1b",
+    train_bars: int = 1000,
+    test_bars: int = 200,
+    purge_bars: int = 5,
+    embargo_bars: int = 5,
+) -> pd.DataFrame:
+    """Executes Walk-Forward Validation with Purging and Embargoing to guarantee
 
-    nifty_df = pl.read_parquet(nifty_path)
-    bank_df = pl.read_parquet(bank_path)
+    zero out-of-fold data leakage or cross-window contamination.
+    """
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    total_samples = len(df)
+    results = []
 
-    # Align timestamps
-    common_ts = nifty_df.select("timestamp").join(bank_df.select("timestamp"), on="timestamp", how="inner").unique()
-    nifty_df = nifty_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
-    bank_df = bank_df.join(common_ts, on="timestamp", how="inner").sort("timestamp")
+    start_idx = 0
 
-    feature_cols = ["bar_change", "volatility_range", "turnover", "sma_15", "sma_60", "std_30", "zscore_close", "rsi_14", "vwap_deviation"]
+    while start_idx + train_bars + purge_bars + test_bars <= total_samples:
+        train_start = start_idx
+        train_end = train_start + train_bars
 
-    # Split train (2018-2025) and test (2026 YTD)
-    nifty_df = nifty_df.with_columns(pl.col("timestamp").cast(pl.Datetime))
-    bank_df = bank_df.with_columns(pl.col("timestamp").cast(pl.Datetime))
+        # Purge buffer eliminates target overlap between train and test sets
+        test_start = train_end + purge_bars
+        test_end = test_start + test_bars
 
-    train_nifty = nifty_df.filter(pl.col("timestamp") < pl.datetime(2026, 1, 1))
-    test_nifty = nifty_df.filter(pl.col("timestamp") >= pl.datetime(2026, 1, 1))
+        if test_end > total_samples:
+            break
 
-    train_bank = bank_df.filter(pl.col("timestamp") < pl.datetime(2026, 1, 1))
-    test_bank = bank_df.filter(pl.col("timestamp") >= pl.datetime(2026, 1, 1))
+        train_df = df.iloc[train_start:train_end].copy()
+        test_df = df.iloc[test_start:test_end].copy()
 
-    return train_nifty, test_nifty, train_bank, test_bank, feature_cols
+        # Fit Scaler strictly inside the current Training fold
+        scaler = StandardScaler()
+        X_train = scaler.fit_transform(train_df[feature_cols])
+        y_train = train_df[target_col].values
+
+        # Apply Training-derived parameters to Test set
+        X_test = scaler.transform(test_df[feature_cols])
+        y_test = test_df[target_col].values
+
+        # Train Dual Alpha Models (e.g., Fast/Short-horizon vs. Slow/Long-horizon components)
+        alpha_fast = Ridge(alpha=10.0)
+        alpha_slow = Ridge(alpha=100.0)
+
+        alpha_fast.fit(X_train, y_train)
+        alpha_slow.fit(X_train, y_train)
+
+        preds_fast = alpha_fast.predict(X_test)
+        preds_slow = alpha_slow.predict(X_test)
+
+        # Enforce ensemble combination strictly on test period
+        combined_signal = 0.6 * preds_fast + 0.4 * preds_slow
+
+        fold_res = test_df[["timestamp", "close", target_col]].copy()
+        fold_res["pred_fast"] = preds_fast
+        fold_res["pred_slow"] = preds_slow
+        fold_res["alpha_signal"] = combined_signal
+        fold_res["fold_id"] = start_idx
+
+        results.append(fold_res)
+
+        # Embargo step advances start_idx beyond immediate test boundary
+        start_idx += test_bars + embargo_bars
+
+    if not results:
+        raise ValueError(
+            "Insufficient dataset length for configured walk-forward parameters."
+        )
+
+    return pd.concat(results, ignore_index=True)
 
 
-def create_tensors(df_nifty: pl.DataFrame, df_bank: pl.DataFrame, feature_cols: list, seq_len: int = 15):
-    f_nifty = df_nifty.select(feature_cols).to_numpy().astype(np.float32)
-    f_bank = df_bank.select(feature_cols).to_numpy().astype(np.float32)
-    targets = df_nifty.select("target_5m_return").to_numpy().squeeze().astype(np.float32)
+def calculate_leak_free_metrics(results_df: pd.DataFrame) -> dict:
+    """Calculates backtest signal metrics after applying Zerodha-style transaction
 
-    num_samples = len(f_nifty) - seq_len
-    X_nifty = np.empty((num_samples, len(feature_cols), seq_len), dtype=np.float32)
-    X_bank = np.empty((num_samples, len(feature_cols), seq_len), dtype=np.float32)
-    Y_target = np.empty((num_samples,), dtype=np.float32)
+    costs and slippage.
+    """
+    df = results_df.copy()
 
-    for i in range(num_samples):
-        X_nifty[i] = f_nifty[i : i + seq_len].T
-        X_bank[i] = f_bank[i : i + seq_len].T
-        Y_target[i] = targets[i + seq_len]
+    # Signal position: Long if alpha_signal > 0, Short if < 0
+    df["position"] = np.sign(df["alpha_signal"])
 
-    return torch.from_numpy(X_nifty), torch.from_numpy(X_bank), torch.from_numpy(Y_target)
+    # Returns = Position * Next bar return - Friction (Slippage + Brokerage/STT)
+    cost_per_trade_bps = 0.0005  # ~5 bps friction for Indian markets
+    df["position_change"] = df["position"].diff().abs().fillna(0)
+    df["friction"] = df["position_change"] * cost_per_trade_bps
 
+    df["strategy_ret"] = (df["position"] * df["target_1b"]) - df["friction"]
 
-def run_pipeline():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[+] Device: {device}")
+    cum_return = (1 + df["strategy_ret"]).prod() - 1
+    sharpe = (
+        (df["strategy_ret"].mean() / (df["strategy_ret"].std() + 1e-8))
+        * np.sqrt(252 * 375)  # Minute bar annualized factor
+    )
 
-    train_nifty, test_nifty, train_bank, test_bank, feature_cols = load_train_test_split()
-    print(f"[+] Train rows (2018-2025): {len(train_nifty)} | Test rows (2026 YTD): {len(test_nifty)}")
-
-    X_train_n, X_train_b, Y_train = create_tensors(train_nifty, train_bank, feature_cols)
-    X_test_n, X_test_b, Y_test = create_tensors(test_nifty, test_bank, feature_cols)
-
-    train_loader = DataLoader(TensorDataset(X_train_n, X_train_b, Y_train), batch_size=1024, shuffle=True)
-    test_loader = DataLoader(TensorDataset(X_test_n, X_test_b, Y_test), batch_size=2048, shuffle=False)
-
-    model = DualAlphaTCN(in_channels=len(feature_cols)).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    criterion = DifferentialSharpeLoss()
-
-    print("\n[+] Training Model on 2018–2025 Futures Data...")
-    model.train()
-    for epoch in range(1, 11):
-        total_loss = 0.0
-        for batch_xn, batch_xb, batch_y in train_loader:
-            batch_xn, batch_xb, batch_y = batch_xn.to(device), batch_xb.to(device), batch_y.to(device)
-
-            optimizer.zero_grad(set_to_none=True)
-            z_n, z_b = model(batch_xn, batch_xb)
-            loss = criterion(z_n.squeeze(), batch_y) + criterion(z_b.squeeze(), batch_y)
-
-            if not torch.isnan(loss):
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                total_loss += loss.item()
-
-        print(f"   Epoch {epoch:02d} | Train Sharpe Loss: {total_loss / len(train_loader):.4f}")
-
-    # Out-of-Sample Evaluation on 2026 YTD
-    print("\n[+] Evaluating Out-of-Sample Strategy on 2026 YTD Data...")
-    model.eval()
-    all_signals = []
-    all_returns = []
-
-    with torch.no_grad():
-        for batch_xn, batch_xb, batch_y in test_loader:
-            batch_xn, batch_xb = batch_xn.to(device), batch_xb.to(device)
-            z_n, _ = model(batch_xn, batch_xb)
-
-            all_signals.append(z_n.squeeze().cpu().numpy())
-            all_returns.append(batch_y.numpy())
-
-    signals = np.concatenate(all_signals)
-    returns = np.concatenate(all_returns)
-
-    # Convert continuous signals [-1, 1] to trade positions
-    interpreter = FuturesToOptionsInterpreter(long_threshold=0.35, short_threshold=-0.35)
-    positions = np.zeros_like(signals)
-    positions[signals >= 0.35] = 1.0   # Long / Buy Call
-    positions[signals <= -0.35] = -1.0  # Short / Buy Put
-
-    strategy_returns = positions * returns
-    cum_returns = np.cumsum(strategy_returns)
-
-    total_return_pct = np.sum(strategy_returns) * 100
-    daily_sharpe = np.mean(strategy_returns) / (np.std(strategy_returns) + 1e-6) * np.sqrt(375)
-    win_rate = (np.sum(strategy_returns > 0) / (np.sum(positions != 0) + 1e-6)) * 100
-
-    print("=" * 50)
-    print("      2026 YTD BACKTEST RESULTS (UNLEVERAGED)     ")
-    print("=" * 50)
-    print(f"  Total Trades Taken : {np.sum(positions != 0)}")
-    print(f"  Win Rate           : {win_rate:.2f}%")
-    print(f"  Cumulative Return  : {total_return_pct:.2f}%")
-    print(f"  Annualized Sharpe  : {daily_sharpe:.2f}")
-    print("=" * 50)
+    return {
+        "cumulative_return": cum_return,
+        "sharpe_ratio": sharpe,
+        "total_trades": int((df["position_change"] > 0).sum()),
+    }
 
 
 if __name__ == "__main__":
-    run_pipeline()
+    from features.build_features import compute_features_leak_free
+
+    # Generate test market series
+    np.random.seed(42)
+    dates = pd.date_range("2026-01-01", periods=3000, freq="1min")
+    raw_df = pd.DataFrame(
+        {
+            "timestamp": dates,
+            "open": 100 + np.random.randn(3000).cumsum(),
+            "high": 101 + np.random.randn(3000).cumsum(),
+            "low": 99 + np.random.randn(3000).cumsum(),
+            "close": 100 + np.random.randn(3000).cumsum(),
+            "volume": np.random.randint(500, 5000, size=3000),
+        }
+    )
+
+    feat_df = compute_features_leak_free(raw_df)
+    feats = [c for c in feat_df.columns if c.startswith("feat_")]
+
+    oof_predictions = purged_walk_forward_cv(
+        feat_df,
+        feature_cols=feats,
+        train_bars=1500,
+        test_bars=300,
+        purge_bars=10,
+    )
+
+    metrics = calculate_leak_free_metrics(oof_predictions)
+    print("Dual Alpha Training Complete.")
+    print(f"Out-of-Fold Samples: {len(oof_predictions)}")
+    print(
+        f"Sharpe: {metrics['sharpe_ratio']:.2f} | Cum Return: {metrics['cumulative_return']:.2%}"
+    )
